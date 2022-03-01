@@ -24,7 +24,7 @@ use mz_lowertest::MzReflect;
 use mz_ore::cast;
 
 /// The number of internal decimal units in a [`Numeric`] value.
-pub const NUMERIC_DATUM_WIDTH: u8 = 13;
+pub const NUMERIC_DATUM_WIDTH: u8 = 26;
 
 /// The value of [`NUMERIC_DATUM_WIDTH`] as a [`u8`].
 pub const NUMERIC_DATUM_WIDTH_USIZE: usize = cast::u8_to_usize(NUMERIC_DATUM_WIDTH);
@@ -36,7 +36,7 @@ pub const NUMERIC_DATUM_MAX_PRECISION: u8 = NUMERIC_DATUM_WIDTH * 3;
 pub type Numeric = Decimal<NUMERIC_DATUM_WIDTH_USIZE>;
 
 /// The number of internal decimal units in a [`NumericAgg`] value.
-pub const NUMERIC_AGG_WIDTH: u8 = 27;
+pub const NUMERIC_AGG_WIDTH: u8 = 54;
 
 /// The value of [`NUMERIC_AGG_WIDTH`] as a [`u8`].
 pub const NUMERIC_AGG_WIDTH_USIZE: usize = cast::u8_to_usize(NUMERIC_AGG_WIDTH);
