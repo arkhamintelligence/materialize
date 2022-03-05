@@ -21,7 +21,7 @@ use timely::progress::ChangeBatch;
 use timely::worker::Worker as TimelyWorker;
 use tokio::sync::mpsc;
 
-use mz_dataflow_types::client::{ComputeCommand, ComputeResponse, Response};
+use mz_dataflow_types::client::{ComputeCommand, ComputeInstanceId, ComputeResponse, Response};
 use mz_dataflow_types::logging::LoggingConfig;
 use mz_dataflow_types::{DataflowError, PeekResponse, TailResponse};
 use mz_expr::GlobalId;
@@ -70,6 +70,8 @@ pub struct ActiveComputeState<'a, A: Allocate, B: ComputeReplay> {
     pub timely_worker: &'a mut TimelyWorker<A>,
     /// The compute state itself.
     pub compute_state: &'a mut ComputeState,
+    /// The identifier of the compute instance, for forming responses.
+    pub instance_id: ComputeInstanceId,
     /// The channel over which frontier information is reported.
     pub response_tx: &'a mut mpsc::UnboundedSender<Response>,
     /// The boundary with the Storage layer
@@ -86,6 +88,7 @@ impl<'a, A: Allocate, B: ComputeReplay> ActiveComputeState<'a, A, B> {
                 }
             }
             ComputeCommand::DropInstance => {}
+
             ComputeCommand::CreateDataflows(dataflows) => {
                 for dataflow in dataflows.into_iter() {
                     for (sink_id, _) in dataflow.sink_exports.iter() {
@@ -117,27 +120,33 @@ impl<'a, A: Allocate, B: ComputeReplay> ActiveComputeState<'a, A, B> {
                     );
                 }
             }
+            ComputeCommand::AllowCompaction(list) => {
+                for (id, frontier) in list {
+                    if frontier.is_empty() {
+                        // Indicates that we may drop `id`, as there are no more valid times to read.
 
-            ComputeCommand::DropSinks(ids) => {
-                for id in ids {
-                    self.compute_state.reported_frontiers.remove(&id);
-                    self.compute_state.sink_write_frontiers.remove(&id);
-                    self.compute_state.dataflow_tokens.remove(&id);
-                }
-            }
-            ComputeCommand::DropIndexes(ids) => {
-                for id in ids {
-                    self.compute_state.traces.del_trace(&id);
-                    let frontier = self
-                        .compute_state
-                        .reported_frontiers
-                        .remove(&id)
-                        .expect("Dropped index with no frontier");
-                    if let Some(logger) = self.compute_state.materialized_logger.as_mut() {
-                        logger.log(MaterializedEvent::Dataflow(id, false));
-                        for time in frontier.elements().iter() {
-                            logger.log(MaterializedEvent::Frontier(id, *time, -1));
+                        // Sink-specific work:
+                        self.compute_state.sink_write_frontiers.remove(&id);
+                        self.compute_state.dataflow_tokens.remove(&id);
+                        // Index-specific work:
+                        self.compute_state.traces.del_trace(&id);
+
+                        // Work common to sinks and indexes (removing frontier tracking and cleaning up logging).
+                        let frontier = self
+                            .compute_state
+                            .reported_frontiers
+                            .remove(&id)
+                            .expect("Dropped compute collection with no frontier");
+                        if let Some(logger) = self.compute_state.materialized_logger.as_mut() {
+                            logger.log(MaterializedEvent::Dataflow(id, false));
+                            for time in frontier.elements().iter() {
+                                logger.log(MaterializedEvent::Frontier(id, *time, -1));
+                            }
                         }
+                    } else {
+                        self.compute_state
+                            .traces
+                            .allow_compaction(id, frontier.borrow());
                     }
                 }
             }
@@ -187,7 +196,6 @@ impl<'a, A: Allocate, B: ComputeReplay> ActiveComputeState<'a, A, B> {
                     self.compute_state.pending_peeks.push(peek);
                 }
             }
-
             ComputeCommand::CancelPeek { conn_id } => {
                 let pending_peeks_len = self.compute_state.pending_peeks.len();
                 let mut pending_peeks = std::mem::replace(
@@ -200,13 +208,6 @@ impl<'a, A: Allocate, B: ComputeReplay> ActiveComputeState<'a, A, B> {
                     } else {
                         self.compute_state.pending_peeks.push(peek);
                     }
-                }
-            }
-            ComputeCommand::AllowIndexCompaction(list) => {
-                for (id, frontier) in list {
-                    self.compute_state
-                        .traces
-                        .allow_compaction(id, frontier.borrow());
                 }
             }
         }
@@ -589,9 +590,8 @@ impl<'a, A: Allocate, B: ComputeReplay> ActiveComputeState<'a, A, B> {
     fn send_compute_response(&self, response: ComputeResponse) {
         // Ignore send errors because the coordinator is free to ignore our
         // responses. This happens during shutdown.
-        let _ = self.response_tx.send(Response::Compute(
-            response,
-            mz_dataflow_types::client::DEFAULT_COMPUTE_INSTANCE_ID,
-        ));
+        let _ = self
+            .response_tx
+            .send(Response::Compute(response, self.instance_id));
     }
 }

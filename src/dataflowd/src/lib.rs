@@ -14,6 +14,7 @@
 
 #![deny(missing_docs)]
 
+use anyhow::Context;
 use async_trait::async_trait;
 
 use mz_dataflow_types::client::{partitioned::Partitioned, Client, Command, Response};
@@ -26,10 +27,16 @@ pub struct RemoteClient {
 
 impl RemoteClient {
     /// Construct a client backed by multiple tcp connections
-    pub async fn connect(addrs: &[impl tokio::net::ToSocketAddrs]) -> Result<Self, anyhow::Error> {
+    pub async fn connect(
+        addrs: &[impl tokio::net::ToSocketAddrs + std::fmt::Display],
+    ) -> Result<Self, anyhow::Error> {
         let mut remotes = Vec::with_capacity(addrs.len());
         for addr in addrs.iter() {
-            remotes.push(tcp::TcpClient::connect(addr).await?);
+            remotes.push(
+                tcp::TcpClient::connect(addr)
+                    .await
+                    .with_context(|| format!("Connecting to {addr}"))?,
+            );
         }
         Ok(Self {
             client: Partitioned::new(remotes),
@@ -39,12 +46,48 @@ impl RemoteClient {
 
 #[async_trait(?Send)]
 impl Client for RemoteClient {
-    async fn send(&mut self, cmd: Command) {
-        trace!("Broadcasting dataflow command: {:?}", cmd);
+    async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
+        trace!("Sending dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
     async fn recv(&mut self) -> Option<Response> {
-        self.client.recv().await
+        let response = self.client.recv().await;
+        trace!("Receiving dataflow response: {:?}", response);
+        response
+    }
+}
+
+/// A [Client] backed by separate clients for storage and compute.
+pub struct SplitClient<S, C> {
+    storage_client: S,
+    compute_client: C,
+}
+
+impl<S: Client, C: Client> SplitClient<S, C> {
+    /// Construct a new split client
+    pub fn new(storage_client: S, compute_client: C) -> Self {
+        Self {
+            storage_client,
+            compute_client,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl<S: Client, C: Client> Client for SplitClient<S, C> {
+    async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
+        trace!("SplitClient: Sending dataflow command: {:?}", cmd);
+        match cmd {
+            cmd @ Command::Compute(_, _) => self.compute_client.send(cmd),
+            cmd @ Command::Storage(_) => self.storage_client.send(cmd),
+        }
+        .await
+    }
+    async fn recv(&mut self) -> Option<Response> {
+        tokio::select! {
+            response = self.compute_client.recv() => response,
+            response = self.storage_client.recv() => response,
+        }
     }
 }
 
@@ -59,7 +102,7 @@ pub mod tcp {
     use tokio_serde::formats::Bincode;
     use tokio_util::codec::LengthDelimitedCodec;
 
-    use mz_dataflow_types::client::{Command, Response};
+    use mz_dataflow_types::client::{Client, Command, Response};
 
     /// A client to a remote dataflow server.
     pub struct TcpClient {
@@ -75,16 +118,13 @@ pub mod tcp {
     }
 
     #[async_trait(?Send)]
-    impl mz_dataflow_types::client::Client for TcpClient {
-        async fn send(&mut self, cmd: mz_dataflow_types::client::Command) {
+    impl Client for TcpClient {
+        async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
             // TODO: something better than panicking.
-            self.connection
-                .send(cmd)
-                .await
-                .expect("worker command receiver should not drop first");
+            self.connection.send(cmd).await.map_err(|err| err.into())
         }
 
-        async fn recv(&mut self) -> Option<mz_dataflow_types::client::Response> {
+        async fn recv(&mut self) -> Option<Response> {
             // TODO: something better than panicking.
             self.connection
                 .next()

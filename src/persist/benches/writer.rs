@@ -29,8 +29,9 @@ use tokio::runtime::Runtime as AsyncRuntime;
 use mz_persist::client::WriteReqBuilder;
 use mz_persist::error::Error;
 use mz_persist::file::{FileBlob, FileLog};
+use mz_persist::gen::persist::ProtoBatchFormat;
 use mz_persist::indexed::cache::BlobCache;
-use mz_persist::indexed::encoding::{BlobTraceBatch, BlobUnsealedBatch, Id};
+use mz_persist::indexed::encoding::{BlobTraceBatchPart, BlobUnsealedBatch, Id};
 use mz_persist::indexed::metrics::Metrics;
 use mz_persist::indexed::{Cmd, Indexed};
 use mz_persist::mem::MemRegistry;
@@ -217,7 +218,11 @@ fn bench_set_unsealed_batch<B: Blob>(
                 updates,
             };
             cache
-                .set_unsealed_batch(format!("{}", rng.gen::<usize>()), batch)
+                .set_unsealed_batch(
+                    format!("{}", rng.gen::<usize>()),
+                    batch,
+                    ProtoBatchFormat::ParquetKvtd,
+                )
                 .expect("writing to blobcache failed");
         }
         start.elapsed()
@@ -293,12 +298,13 @@ pub fn bench_encode_batch(data: &DataGenerator, g: &mut BenchmarkGroup<'_, WallT
         desc: SeqNo(0)..SeqNo(1),
         updates: data.batches().collect::<Vec<_>>(),
     };
-    let trace = BlobTraceBatch {
+    let trace = BlobTraceBatchPart {
         desc: Description::new(
             Antichain::from_elem(0),
             Antichain::from_elem(1),
             Antichain::from_elem(0),
         ),
+        index: 0,
         updates: data.batches().collect::<Vec<_>>(),
     };
 

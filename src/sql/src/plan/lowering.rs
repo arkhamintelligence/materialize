@@ -351,7 +351,7 @@ impl HirRelationExpr {
                                 &mut input,
                                 &Some(&subquery_map),
                             );
-                            input = input.map(vec![scalar]);
+                            input = input.map_one(scalar);
                             scalar_columns.push(input.arity() - 1);
                         }
 
@@ -457,7 +457,7 @@ impl HirRelationExpr {
                                 .column_types
                                 .into_iter()
                                 .skip(get_left.arity())
-                                .map(|typ| (Datum::Null, typ.nullable(true)))
+                                .map(|typ| (Datum::Null, typ.scalar_type))
                                 .collect();
                             get_left.lookup(id_gen, join, default)
                         } else {
@@ -482,14 +482,14 @@ impl HirRelationExpr {
                     // depending on the type of join.
                     let oa = get_outer.arity();
                     let left = left.applied_to(id_gen, get_outer.clone(), col_map, cte_map);
-                    let lt = left.typ();
-                    let la = left.arity() - oa;
+                    let lt = left.typ().column_types.into_iter().skip(oa).collect_vec();
+                    let la = lt.len();
                     left.let_in(id_gen, |id_gen, get_left| {
                         let right_col_map = col_map.enter_scope(0);
                         let right =
                             right.applied_to(id_gen, get_outer.clone(), &right_col_map, cte_map);
-                        let rt = right.typ();
-                        let ra = right.arity() - oa;
+                        let rt = right.typ().column_types.into_iter().skip(oa).collect_vec();
+                        let ra = rt.len();
                         right.let_in(id_gen, |id_gen, get_right| {
                             let mut product = SR::join(
                                 vec![get_left.clone(), get_right.clone()],
@@ -536,10 +536,8 @@ impl HirRelationExpr {
                                     let left_outer = get_left.clone().anti_lookup(
                                         id_gen,
                                         get_join.clone(),
-                                        rt.column_types
-                                            .into_iter()
-                                            .skip(oa)
-                                            .map(|typ| (Datum::Null, typ.nullable(true)))
+                                        rt.into_iter()
+                                            .map(|typ| (Datum::Null, typ.scalar_type))
                                             .collect(),
                                     );
                                     result = result.union(left_outer);
@@ -557,10 +555,8 @@ impl HirRelationExpr {
                                                         .chain((oa)..(oa + la))
                                                         .collect(),
                                                 ),
-                                            lt.column_types
-                                                .into_iter()
-                                                .skip(oa)
-                                                .map(|typ| (Datum::Null, typ.nullable(true)))
+                                            lt.into_iter()
+                                                .map(|typ| (Datum::Null, typ.scalar_type))
                                                 .collect(),
                                         )
                                         // swap left and right back again
@@ -614,12 +610,7 @@ impl HirRelationExpr {
                     let input_type = input.typ();
                     let default = applied_aggregates
                         .iter()
-                        .map(|agg| {
-                            (
-                                agg.func.default(),
-                                agg.typ(&input_type).nullable(agg.func.default().is_null()),
-                            )
-                        })
+                        .map(|agg| (agg.func.default(), agg.typ(&input_type).scalar_type))
                         .collect();
                     // NOTE we don't need to remove any extra columns from aggregate.applied_to above because the reduce will do that anyway
                     let mut reduced =
@@ -799,7 +790,7 @@ impl HirScalarExpr {
                             );
                             let then_arity = then_inner.arity();
                             then_inner = then_inner
-                                .map(vec![then_expr])
+                                .map_one(then_expr)
                                 .project((0..inner_arity).chain(Some(then_arity)).collect());
 
                             // Restrict to records not satisfying `cond_expr` and apply `els` as a map.
@@ -824,7 +815,7 @@ impl HirScalarExpr {
                             );
                             let else_arity = else_inner.arity();
                             else_inner = else_inner
-                                .map(vec![else_expr])
+                                .map_one(else_expr)
                                 .project((0..inner_arity).chain(Some(else_arity)).collect());
 
                             // concatenate the two results.
@@ -920,7 +911,7 @@ impl HirScalarExpr {
                                             if let mz_expr::MirScalarExpr::Column(c) = key {
                                                 group_key.push(c);
                                             } else {
-                                                get_inner = get_inner.map(vec![key]);
+                                                get_inner = get_inner.map_one(key);
                                                 group_key.push(get_inner.arity() - 1);
                                             }
                                         }
@@ -1014,8 +1005,10 @@ impl HirScalarExpr {
 
                                             // Unpack the record
                                             for c in 0..input_arity {
-                                                reduce = reduce.take_dangerous().map(vec![
-                                                    mz_expr::MirScalarExpr::CallUnary {
+                                                reduce =
+                                                    reduce
+                                                        .take_dangerous()
+                                                        .map_one(mz_expr::MirScalarExpr::CallUnary {
                                                         func: mz_expr::UnaryFunc::RecordGet(c),
                                                         expr: Box::new(
                                                             mz_expr::MirScalarExpr::CallUnary {
@@ -1029,19 +1022,18 @@ impl HirScalarExpr {
                                                                 ),
                                                             },
                                                         ),
-                                                    },
-                                                ]);
+                                                    });
                                             }
 
                                             // Append the column with the result of the window function.
-                                            reduce = reduce.take_dangerous().map(vec![
+                                            reduce = reduce.take_dangerous().map_one(
                                                 mz_expr::MirScalarExpr::CallUnary {
                                                     func: mz_expr::UnaryFunc::RecordGet(0),
                                                     expr: Box::new(mz_expr::MirScalarExpr::Column(
                                                         record_col,
                                                     )),
                                                 },
-                                            ]);
+                                            );
 
                                             let agg_col = record_col + 1 + input_arity;
                                             reduce.project(
@@ -1432,15 +1424,15 @@ fn apply_scalar_subquery(
                             mz_expr::BinaryFunc::Gt,
                         )])
                     .project((0..inner_arity).collect::<Vec<_>>())
-                    .map(vec![mz_expr::MirScalarExpr::literal(
+                    .map_one(mz_expr::MirScalarExpr::literal(
                         Err(mz_expr::EvalError::MultipleRowsFromSubquery),
                         col_type.clone().scalar_type,
-                    )]);
+                    ));
                 // Return `get_select` and any errors added in.
                 get_select.union(errors)
             });
             // append Null to anything that didn't return any rows
-            let default = vec![(Datum::Null, col_type.nullable(true))];
+            let default = vec![(Datum::Null, col_type.scalar_type)];
             get_inner.lookup(id_gen, guarded, default)
         },
     )
@@ -1477,8 +1469,7 @@ fn apply_existential_subquery(
                     RelationType::new(vec![ScalarType::Bool.nullable(false)]),
                 ));
             // append False to anything that didn't return any rows
-            let default = vec![(Datum::False, ScalarType::Bool.nullable(false))];
-            get_inner.lookup(id_gen, exists, default)
+            get_inner.lookup(id_gen, exists, vec![(Datum::False, ScalarType::Bool)])
         },
     )
 }
@@ -1505,30 +1496,25 @@ impl AggregateExpr {
     }
 }
 
-/// Attempts an efficient outer join, if `on` has equijoin structure.
-fn attempt_outer_join(
-    left: mz_expr::MirRelationExpr,
-    right: mz_expr::MirRelationExpr,
-    on: mz_expr::MirScalarExpr,
-    kind: JoinKind,
+// TODO: move this to the `mz_expr` crate.
+/// If the on clause of an outer join is an equijoin, figure out the join keys.
+///
+/// `oa`, `la`, and `ra` are the arities of `outer`, the lhs, and the rhs
+/// respectively.
+pub(crate) fn derive_equijoin_cols(
     oa: usize,
-    id_gen: &mut mz_ore::id_gen::IdGen,
-) -> Option<mz_expr::MirRelationExpr> {
+    la: usize,
+    ra: usize,
+    on: Vec<mz_expr::MirScalarExpr>,
+) -> Option<(Vec<usize>, Vec<usize>)> {
     use mz_expr::BinaryFunc;
-
-    // Both `left` and `right` are decorrelated inputs, whose first `oa` calumns
-    // correspond to an outer context: we should do the outer join independently
-    // for each prefix. In the case that `on` is just some equality tests between
-    // columns of `left` and `right`, we can employ a relatively simple plan.
-
-    let la = left.arity() - oa;
-    let lt = left.typ();
-    let ra = right.arity() - oa;
-    let rt = right.typ();
-
+    // TODO: Replace this predicate deconstruction with
+    // `mz_expr::canonicalize::canonicalize_predicates`, which will also enable
+    // treating select * from lhs left join rhs on lhs.id = rhs.id and true as
+    // an equijoin.
     // Deconstruct predicates that may be ands of multiple conditions.
     let mut predicates = Vec::new();
-    let mut todo = vec![on.clone()];
+    let mut todo = on;
     while let Some(next) = todo.pop() {
         if let mz_expr::MirScalarExpr::CallBinary {
             expr1,
@@ -1568,8 +1554,37 @@ fn attempt_outer_join(
     }
     // If any predicates were not column equivs, give up.
     if l_keys.len() < predicates.len() {
+        None
+    } else {
+        Some((l_keys, r_keys))
+    }
+}
+
+/// Attempts an efficient outer join, if `on` has equijoin structure.
+fn attempt_outer_join(
+    left: mz_expr::MirRelationExpr,
+    right: mz_expr::MirRelationExpr,
+    on: mz_expr::MirScalarExpr,
+    kind: JoinKind,
+    oa: usize,
+    id_gen: &mut mz_ore::id_gen::IdGen,
+) -> Option<mz_expr::MirRelationExpr> {
+    // Both `left` and `right` are decorrelated inputs, whose first `oa` calumns
+    // correspond to an outer context: we should do the outer join independently
+    // for each prefix. In the case that `on` is just some equality tests between
+    // columns of `left` and `right`, we can employ a relatively simple plan.
+
+    let lt = left.typ().column_types.into_iter().skip(oa).collect_vec();
+    let la = lt.len();
+    let rt = right.typ().column_types.into_iter().skip(oa).collect_vec();
+    let ra = rt.len();
+
+    let equijoin_keys = derive_equijoin_cols(oa, la, ra, vec![on.clone()]);
+    if equijoin_keys.is_none() {
         return None;
     }
+
+    let (l_keys, r_keys) = equijoin_keys.unwrap();
 
     // If we've gotten this far, we can do the clever thing.
     // We'll want to use left and right multiple times
@@ -1622,9 +1637,7 @@ fn attempt_outer_join(
 
                         // Determine the types of nulls to use as filler.
                         let right_fill = rt
-                            .column_types
                             .into_iter()
-                            .skip(oa)
                             .map(|typ| mz_expr::MirScalarExpr::literal_null(typ.scalar_type))
                             .collect();
 
@@ -1650,9 +1663,7 @@ fn attempt_outer_join(
 
                         // Determine the types of nulls to use as filler.
                         let left_fill = lt
-                            .column_types
                             .into_iter()
-                            .skip(oa)
                             .map(|typ| mz_expr::MirScalarExpr::literal_null(typ.scalar_type))
                             .collect();
 

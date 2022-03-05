@@ -35,6 +35,10 @@ skip = [
     { name = "arrayvec", version = "0.5.2" },
 ]
 
+# Use `tracing` instead.
+[[bans.deny]]
+name = "env_logger"
+
 # Use `prost` or `protobuf-native` instead.
 [[bans.deny]]
 name = "protobuf"
@@ -135,6 +139,7 @@ allow = [
     "ICU",
     "ISC",
     "MIT",
+    "Zlib",
 ]
 copyleft = "deny"
 private = { ignore = true }
@@ -156,9 +161,6 @@ allow-git = [
 
     # Waiting on https://github.com/blackbeam/rust_mysql_common/pull/55
     "https://github.com/blackbeam/rust_mysql_common.git",
-
-    # See the patch in Cargo.toml.
-    "https://github.com/MaterializeInc/headers.git",
 
     # Waiting on several PRs to a mostly-abandoned upstream library.
     "https://github.com/MaterializeInc/pubnub-rust.git",

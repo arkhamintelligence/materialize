@@ -30,7 +30,7 @@ use mz_persist_types::Codec;
 use mz_dataflow_types::sources::{encoding::*, persistence::*, *};
 use mz_dataflow_types::*;
 use mz_expr::{GlobalId, PartitionId, SourceInstanceId};
-use mz_repr::{Diff, Row, Timestamp};
+use mz_repr::{Diff, Row, RowPacker, Timestamp};
 use timely::progress::Antichain;
 
 use crate::decode::decode_cdcv2;
@@ -65,6 +65,7 @@ pub(crate) fn import_table<G>(
     as_of_frontier: &timely::progress::Antichain<mz_repr::Timestamp>,
     storage_state: &mut crate::server::StorageState,
     scope: &mut G,
+    id: SourceInstanceId,
     persisted_name: Option<String>,
 ) -> (
     LocalInput,
@@ -102,8 +103,7 @@ where
             let persist_err_collection = persist_err_stream
                 .concat(&decode_err_stream)
                 .map(move |(err, ts, diff)| {
-                    let err =
-                        SourceError::new(stream_name.clone(), SourceErrorDetails::Persistence(err));
+                    let err = SourceError::new(id, SourceErrorDetails::Persistence(err));
                     (err.into(), ts, diff)
                 })
                 .as_collection();
@@ -118,7 +118,7 @@ where
     let local_input = LocalInput { handle, capability };
     let as_of_frontier = as_of_frontier.clone();
     let ok_collection = ok_stream
-        .map_in_place(move |(_, mut time, _)| {
+        .map_in_place(move |(_, time, _)| {
             time.advance_by(as_of_frontier.borrow());
         })
         .as_collection();
@@ -160,6 +160,12 @@ where
     // Tokens that we should return from the method.
     let mut needed_tokens: Vec<Rc<dyn std::any::Any>> = Vec::new();
 
+    // This uid must be unique across all different instantiations of a source
+    let uid = SourceInstanceId {
+        source_id: src_id,
+        dataflow_id,
+    };
+
     // Before proceeding, we may need to remediate sources with non-trivial relational
     // expressions that post-process the bare source. If the expression is trivial, a
     // get of the bare source, we can present `src.operators` to the source directly.
@@ -172,7 +178,7 @@ where
         // via Command::Insert commands.
         SourceConnector::Local { persisted_name, .. } => {
             let (local_input, (ok, err)) =
-                import_table(as_of_frontier, storage_state, scope, persisted_name);
+                import_table(as_of_frontier, storage_state, scope, uid, persisted_name);
             storage_state.local_inputs.insert(src_id, local_input);
 
             // TODO(mcsherry): Local tables are a special non-source we should relocate.
@@ -188,12 +194,6 @@ where
             timeline: _,
         } => {
             // TODO(benesch): this match arm is hard to follow. Refactor.
-
-            // This uid must be unique across all different instantiations of a source
-            let uid = SourceInstanceId {
-                source_id: src_id,
-                dataflow_id,
-            };
 
             // All sources should push their various error streams into this vector,
             // whose contents will be concatenated and inserted along the collection.
@@ -230,7 +230,6 @@ where
             let source_name = format!("{}-{}", connector.name(), uid);
             let source_config = SourceConfig {
                 name: source_name.clone(),
-                sql_name: src.name.clone(),
                 upstream_name: connector.upstream_name().map(ToOwned::to_owned),
                 id: uid,
                 scope,
@@ -251,7 +250,7 @@ where
                 pubnub_connector,
             ) = connector
             {
-                let source = PubNubSourceReader::new(src.name.clone(), pubnub_connector);
+                let source = PubNubSourceReader::new(uid, pubnub_connector);
                 let ((ok_stream, err_stream), capability) =
                     source::create_source_simple(source_config, source);
 
@@ -264,11 +263,8 @@ where
 
                 (ok_stream.as_collection(), capability)
             } else if let ExternalSourceConnector::Postgres(pg_connector) = connector {
-                let source = PostgresSourceReader::new(
-                    src.name.clone(),
-                    pg_connector,
-                    source_config.base_metrics,
-                );
+                let source =
+                    PostgresSourceReader::new(uid, pg_connector, source_config.base_metrics);
 
                 let ((ok_stream, err_stream), capability) =
                     source::create_source_simple(source_config, source);
@@ -380,7 +376,7 @@ where
                                 &envelope,
                                 metadata_columns,
                                 &mut linear_operators,
-                                storage_state.metrics.clone(),
+                                storage_state.unspecified_metrics.clone(),
                             ),
                             SourceType::ByteStream(source) => render_decode(
                                 &source,
@@ -388,7 +384,7 @@ where
                                 dataflow_debug_name,
                                 metadata_columns,
                                 &mut linear_operators,
-                                storage_state.metrics.clone(),
+                                storage_state.unspecified_metrics.clone(),
                             ),
                         };
                         if let Some(tok) = extra_token {
@@ -431,6 +427,7 @@ where
 
                                 let (upsert_ok, upsert_err) = super::upsert::upsert(
                                     &upsert_operator_name,
+                                    uid,
                                     &transformed_results,
                                     as_of_frontier,
                                     &mut linear_operators,
@@ -507,6 +504,7 @@ where
                                         let (flattened_stream, persist_errs) =
                                             envelope_none::persist_and_replay(
                                                 &source_name,
+                                                uid,
                                                 &flattened_stream,
                                                 as_of_frontier,
                                                 envelope_config.clone(),
@@ -993,7 +991,7 @@ where
         let val = res.value.map(|val_result| {
             val_result.map(|mut val| {
                 if !res.metadata.is_empty() {
-                    val.extend(res.metadata.into_iter());
+                    RowPacker::for_existing_row(&mut val).extend(res.metadata.into_iter());
                 }
 
                 val
@@ -1024,16 +1022,15 @@ where
             style: UpsertStyle::Default(KeyEnvelope::Named(_)),
             ..
         } => {
-            let mut row_packer = mz_repr::Row::default();
+            let mut row_buf = mz_repr::Row::default();
             results.map(move |mut res| {
                 res.key = res.key.map(|k_result| {
                     k_result.map(|k| {
                         if k.iter().nth(1).is_none() {
                             k
                         } else {
-                            row_packer.clear();
-                            row_packer.push_list(k.iter());
-                            row_packer.finish_and_reuse()
+                            row_buf.packer().push_list(k.iter());
+                            row_buf.clone()
                         }
                     })
                 });
@@ -1064,7 +1061,7 @@ where
             .flat_map(raise_key_value_errors)
             .map(move |maybe_kv| {
                 maybe_kv.map(|(mut key, value)| {
-                    key.extend_by_row(&value);
+                    RowPacker::for_existing_row(&mut key).extend_by_row(&value);
                     key
                 })
             }),
@@ -1076,12 +1073,13 @@ where
                         // Named semantics rename a key that is a single column, and encode a
                         // multi-column field as a struct with that name
                         let row = if key.iter().nth(1).is_none() {
-                            key.extend_by_row(&value);
+                            RowPacker::for_existing_row(&mut key).extend_by_row(&value);
                             key
                         } else {
                             let mut new_row = Row::default();
-                            new_row.push_list(key.iter());
-                            new_row.extend_by_row(&value);
+                            let mut packer = new_row.packer();
+                            packer.push_list(key.iter());
+                            packer.extend_by_row(&value);
                             new_row
                         };
                         row

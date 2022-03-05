@@ -10,28 +10,25 @@
 //! A persistent, compacting data structure containing indexed `(Key, Value,
 //! Time, i64)` entries.
 
-use std::collections::VecDeque;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::{fmt, mem};
+use std::mem;
 
-use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use uuid::Uuid;
 
 use crate::error::Error;
+use crate::gen::persist::ProtoBatchFormat;
 use crate::indexed::background::{
     CompactTraceReq, CompactTraceRes, DrainUnsealedReq, DrainUnsealedRes,
 };
 use crate::indexed::cache::{BlobCache, CacheHint};
 use crate::indexed::columnar::ColumnarRecordsVec;
 use crate::indexed::encoding::{
-    ArrangementMeta, BlobTraceBatch, TraceBatchMeta, UnsealedBatchMeta, UnsealedSnapshotMeta,
+    ArrangementMeta, BlobTraceBatchPart, TraceBatchMeta, UnsealedBatchMeta, UnsealedSnapshotMeta,
 };
-use crate::indexed::{BlobUnsealedBatch, Id, Snapshot};
-use crate::pfuture::PFuture;
+use crate::indexed::snapshot::{ArrangementSnapshot, Snapshot, TraceSnapshot};
+use crate::indexed::{BlobUnsealedBatch, Id};
 use crate::storage::{Blob, BlobRead, SeqNo};
 
 /// A persistent, compacting data structure containing indexed `(Key, Value,
@@ -251,7 +248,8 @@ impl Arrangement {
         };
 
         debug_assert!(ts_upper >= ts_lower);
-        let (format, size_bytes) = blob.set_unsealed_batch(key.clone(), batch)?;
+        let format = ProtoBatchFormat::ParquetKvtd;
+        let size_bytes = blob.set_unsealed_batch(key.clone(), batch, format)?;
         Ok(UnsealedBatchMeta {
             key,
             format,
@@ -393,8 +391,7 @@ impl Arrangement {
         req: DrainUnsealedReq,
     ) -> Result<DrainUnsealedRes, Error> {
         let snap = req.snap.clone().fetch(&blob);
-        let mut updates = snap
-            .into_iter()
+        let mut updates = Snapshot::<Vec<u8>, Vec<u8>>::into_iter(snap)
             .collect::<Result<Vec<_>, Error>>()
             .map_err(|err| format!("failed to fetch snapshot: {}", err))?;
 
@@ -410,17 +407,19 @@ impl Arrangement {
         differential_dataflow::consolidation::consolidate_updates(&mut updates);
 
         let updates = updates.iter().collect::<ColumnarRecordsVec>().into_inner();
-        let batch = BlobTraceBatch {
+        let batch = BlobTraceBatchPart {
             desc: req.desc.clone(),
+            index: 0,
             updates,
         };
 
         let desc = batch.desc.clone();
         let key = Self::new_blob_key();
-        let (format, size_bytes) = blob.set_trace_batch(key.clone(), batch)?;
+        let format = ProtoBatchFormat::ParquetKvtd;
+        let size_bytes = blob.set_trace_batch(key.clone(), batch, format)?;
         // Batches are inserted into the trace with compaction level set to 0.
         let drained = TraceBatchMeta {
-            key,
+            keys: vec![key],
             format,
             desc,
             level: 0,
@@ -622,7 +621,9 @@ impl Arrangement {
             // to populate the cache because the default cache size is small
             // enough that in real workloads large batches won't pollute the
             // cache.
-            batches.push(blob.get_trace_batch_async(&meta.key, CacheHint::MaybeAdd));
+            for key in meta.keys.iter() {
+                batches.push(blob.get_trace_batch_async(key, CacheHint::MaybeAdd));
+            }
         }
         TraceSnapshot {
             ts_upper,
@@ -681,280 +682,10 @@ impl Arrangement {
     }
 }
 
-/// A consistent snapshot of the data that is currently _physically_ in the
-/// unsealed bucket of a persistent [Arrangement].
-#[derive(Debug)]
-pub struct UnsealedSnapshot {
-    /// A closed lower bound on the times of contained updates.
-    pub ts_lower: Antichain<u64>,
-    /// An open upper bound on the times of the contained updates.
-    pub ts_upper: Antichain<u64>,
-    pub(crate) batches: Vec<PFuture<Arc<BlobUnsealedBatch>>>,
-}
-
-impl Snapshot<Vec<u8>, Vec<u8>> for UnsealedSnapshot {
-    type Iter = UnsealedSnapshotIter;
-
-    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<Self::Iter> {
-        let mut iters = Vec::with_capacity(num_iters.get());
-        iters.resize_with(num_iters.get(), || UnsealedSnapshotIter {
-            ts_lower: self.ts_lower.clone(),
-            ts_upper: self.ts_upper.clone(),
-            current_batch: Vec::new(),
-            batches: VecDeque::new(),
-        });
-        // TODO: This should probably distribute batches based on size, but for
-        // now it's simpler to round-robin them.
-        for (i, batch) in self.batches.into_iter().enumerate() {
-            let iter_idx = i % num_iters;
-            iters[iter_idx].batches.push_back(batch);
-        }
-        iters
-    }
-}
-
-/// An [Iterator] representing one part of the data in a [UnsealedSnapshot].
-//
-// This intentionally stores the batches as a VecDeque so we can return the data
-// in roughly increasing timestamp order, but it's unclear if this is in any way
-// important.
-pub struct UnsealedSnapshotIter {
-    /// A closed lower bound on the times of contained updates.
-    ts_lower: Antichain<u64>,
-    /// An open upper bound on the times of the contained updates.
-    ts_upper: Antichain<u64>,
-
-    current_batch: Vec<((Vec<u8>, Vec<u8>), u64, i64)>,
-    batches: VecDeque<PFuture<Arc<BlobUnsealedBatch>>>,
-}
-
-impl fmt::Debug for UnsealedSnapshotIter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnsealedSnapshotIter")
-            .field("ts_lower", &self.ts_lower)
-            .field("ts_upper", &self.ts_upper)
-            .field("current_batch(len)", &self.current_batch.len())
-            .field("batches", &self.batches)
-            .finish()
-    }
-}
-
-impl Iterator for UnsealedSnapshotIter {
-    type Item = Result<((Vec<u8>, Vec<u8>), u64, i64), Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if !self.current_batch.is_empty() {
-                let update = self.current_batch.pop().unwrap();
-                return Some(Ok(update));
-            } else {
-                // current_batch is empty, find a new one.
-                let b = match self.batches.pop_front() {
-                    None => return None,
-                    Some(b) => b,
-                };
-                match b.recv() {
-                    Ok(b) => {
-                        // Reverse the updates so we can pop them off the back
-                        // in roughly increasing time order. At the same time,
-                        // enforce our filter before we clone them. Note that we
-                        // don't reverse the updates within each ColumnarRecords,
-                        // because those are not guaranteed to be in any order.
-                        let ts_lower = self.ts_lower.borrow();
-                        let ts_upper = self.ts_upper.borrow();
-                        self.current_batch.extend(
-                            b.updates
-                                .iter()
-                                .rev()
-                                .flat_map(|u| u.iter())
-                                .filter(|(_, ts, _)| {
-                                    ts_lower.less_equal(&ts) && !ts_upper.less_equal(&ts)
-                                })
-                                .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), t, d)),
-                        );
-                        continue;
-                    }
-                    Err(err) => return Some(Err(err)),
-                }
-            }
-        }
-    }
-}
-
-/// A consistent snapshot of the data that is currently _physically_ in the
-/// trace bucket of a persistent [Arrangement].
-#[derive(Debug)]
-pub struct TraceSnapshot {
-    /// An open upper bound on the times of contained updates.
-    pub ts_upper: Antichain<u64>,
-    /// Since frontier of the given updates.
-    ///
-    /// All updates not at times greater than this frontier must be advanced
-    /// to a time that is equivalent to this frontier.
-    pub since: Antichain<u64>,
-    batches: Vec<PFuture<Arc<BlobTraceBatch>>>,
-}
-
-impl Snapshot<Vec<u8>, Vec<u8>> for TraceSnapshot {
-    type Iter = TraceSnapshotIter;
-
-    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<Self::Iter> {
-        let mut iters = Vec::with_capacity(num_iters.get());
-        iters.resize_with(num_iters.get(), TraceSnapshotIter::default);
-        // TODO: This should probably distribute batches based on size, but for
-        // now it's simpler to round-robin them.
-        for (i, batch) in self.batches.into_iter().enumerate() {
-            let iter_idx = i % num_iters;
-            iters[iter_idx].batches.push_back(batch);
-        }
-        iters
-    }
-}
-
-/// An [Iterator] representing one part of the data in a [TraceSnapshot].
-//
-// This intentionally stores the batches as a VecDeque so we can return the data
-// in roughly increasing timestamp order, but it's unclear if this is in any way
-// important.
-pub struct TraceSnapshotIter {
-    current_batch: Vec<((Vec<u8>, Vec<u8>), u64, i64)>,
-    batches: VecDeque<PFuture<Arc<BlobTraceBatch>>>,
-}
-
-impl Default for TraceSnapshotIter {
-    fn default() -> Self {
-        TraceSnapshotIter {
-            current_batch: Vec::new(),
-            batches: VecDeque::new(),
-        }
-    }
-}
-
-impl fmt::Debug for TraceSnapshotIter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TraceSnapshotIter")
-            .field("current_batch(len)", &self.current_batch.len())
-            .field("batches", &self.batches)
-            .finish()
-    }
-}
-
-impl Iterator for TraceSnapshotIter {
-    type Item = Result<((Vec<u8>, Vec<u8>), u64, i64), Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if !self.current_batch.is_empty() {
-                let update = self.current_batch.pop().unwrap();
-                return Some(Ok(update));
-            } else {
-                // current_batch is empty, find a new one.
-                let b = match self.batches.pop_front() {
-                    None => return None,
-                    Some(b) => b,
-                };
-                match b.recv() {
-                    Ok(b) => {
-                        self.current_batch
-                            .extend(b.updates.iter().flat_map(|u| u.iter()).map(
-                                |((key, val), time, diff)| {
-                                    ((key.to_vec(), val.to_vec()), time, diff)
-                                },
-                            ));
-                        continue;
-                    }
-                    Err(err) => return Some(Err(err)),
-                }
-            }
-        }
-    }
-}
-
-/// A consistent snapshot of all data currently stored for an id.
-#[derive(Debug)]
-pub struct ArrangementSnapshot(
-    pub(crate) UnsealedSnapshot,
-    pub(crate) TraceSnapshot,
-    pub(crate) SeqNo,
-    pub(crate) Antichain<u64>,
-);
-
-impl ArrangementSnapshot {
-    /// Returns the SeqNo at which this snapshot was run.
-    ///
-    /// All writes assigned a seqno < this are included.
-    pub fn seqno(&self) -> SeqNo {
-        self.2
-    }
-
-    /// Returns the since frontier of this snapshot.
-    ///
-    /// All updates at times less than this frontier must be forwarded
-    /// to some time in this frontier.
-    pub fn since(&self) -> Antichain<u64> {
-        self.1.since.clone()
-    }
-
-    /// A logical upper bound on the times that had been added to the collection
-    /// when this snapshot was taken
-    pub(crate) fn get_seal(&self) -> Antichain<u64> {
-        self.3.clone()
-    }
-}
-
-impl Snapshot<Vec<u8>, Vec<u8>> for ArrangementSnapshot {
-    type Iter = ArrangementSnapshotIter;
-
-    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<ArrangementSnapshotIter> {
-        let since = self.since();
-        let ArrangementSnapshot(unsealed, trace, _, _) = self;
-        let unsealed_iters = unsealed.into_iters(num_iters);
-        let trace_iters = trace.into_iters(num_iters);
-        // I don't love the non-debug asserts, but it doesn't seem worth it to
-        // plumb an error around here.
-        assert_eq!(unsealed_iters.len(), num_iters.get());
-        assert_eq!(trace_iters.len(), num_iters.get());
-        unsealed_iters
-            .into_iter()
-            .zip(trace_iters.into_iter())
-            .map(|(unsealed_iter, trace_iter)| ArrangementSnapshotIter {
-                since: since.clone(),
-                iter: trace_iter.chain(unsealed_iter),
-            })
-            .collect()
-    }
-}
-
-/// An [Iterator] representing one part of the data in an [ArrangementSnapshot].
-//
-// This intentionally chains trace before unsealed so we get the data in roughly
-// increasing timestamp order, but it's unclear if this is in any way important.
-#[derive(Debug)]
-pub struct ArrangementSnapshotIter {
-    since: Antichain<u64>,
-    iter: std::iter::Chain<TraceSnapshotIter, UnsealedSnapshotIter>,
-}
-
-impl Iterator for ArrangementSnapshotIter {
-    type Item = Result<((Vec<u8>, Vec<u8>), u64, i64), Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|x| {
-            x.map(|(kv, mut ts, diff)| {
-                // When reading a snapshot, the contract of since is that all
-                // update timestamps will be advanced to it. We do this
-                // physically during compaction, but don't have hard guarantees
-                // about how long that takes, so we have to account for
-                // un-advanced batches on reads.
-                ts.advance_by(self.since.borrow());
-                (kv, ts, diff)
-            })
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use differential_dataflow::trace::Description;
     use tokio::runtime::Runtime as AsyncRuntime;
 
@@ -962,8 +693,8 @@ mod tests {
     use crate::indexed::columnar::ColumnarRecords;
     use crate::indexed::encoding::Id;
     use crate::indexed::metrics::Metrics;
+    use crate::indexed::snapshot::SnapshotExt;
     use crate::indexed::Maintainer;
-    use crate::indexed::SnapshotExt;
     use crate::mem::{MemBlob, MemRegistry};
 
     use super::*;
@@ -1077,7 +808,7 @@ mod tests {
             .iter()
             .cloned()
             .map(|mut b| {
-                b.key = "KEY".to_string();
+                b.keys = vec![];
                 b.size_bytes = 0;
                 b
             })
@@ -1096,7 +827,7 @@ mod tests {
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                key: "key1".to_string(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 2, 0),
                 level: 1,
@@ -1349,7 +1080,7 @@ mod tests {
         let mut t = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                key: "key1".to_string(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 10, 5),
                 level: 1,
@@ -1386,7 +1117,7 @@ mod tests {
         let mut t = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                key: "key1".to_string(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: Description::new(
                     Antichain::from_elem(0),
@@ -1487,14 +1218,14 @@ mod tests {
             cleared_trace(&t.trace_batches),
             vec![
                 TraceBatchMeta {
-                    key: "KEY".to_string(),
+                    keys: vec![],
                     format: ProtoBatchFormat::ParquetKvtd,
                     desc: desc_from(0, 3, 3),
                     level: 1,
                     size_bytes: 0,
                 },
                 TraceBatchMeta {
-                    key: "KEY".to_string(),
+                    keys: vec![],
                     format: ProtoBatchFormat::ParquetKvtd,
                     desc: desc_from(3, 9, 0),
                     level: 0,
@@ -1549,14 +1280,14 @@ mod tests {
             cleared_trace(&t.trace_batches),
             vec![
                 TraceBatchMeta {
-                    key: "KEY".to_string(),
+                    keys: vec![],
                     format: ProtoBatchFormat::ParquetKvtd,
                     desc: desc_from(0, 3, 3),
                     level: 1,
                     size_bytes: 0,
                 },
                 TraceBatchMeta {
-                    key: "KEY".to_string(),
+                    keys: vec![],
                     format: ProtoBatchFormat::ParquetKvtd,
                     desc: desc_from(3, 10, 10),
                     level: 0,

@@ -207,9 +207,17 @@ contains:reuse_topic requires that sink input dependencies are sources, material
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 
 > CREATE SINK output14_custom_consistency_topic FROM input_kafka_cdcv2
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output1-view-${testdrive.seed}'
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output14-view-${testdrive.seed}'
   WITH (reuse_topic=true, consistency_topic='output14-custom-consistency-${testdrive.seed}')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+
+# We need some data -- any data -- to start creating timestamp bindings
+$ kafka-ingest format=avro topic=input_cdcv2 schema=${cdcv2-schema}
+{"array":[{"data":{"a":1,"b":1},"time":1,"diff":1}]}
+{"com.materialize.cdc.progress":{"lower":[0],"upper":[1],"counts":[{"time":1,"count":1}]}}
+
+$ kafka-ingest format=avro topic=input_dbz schema=${dbz-schema} timestamp=1
+{"before": null, "after": {"row": {"a": 1, "b": 1}}}
 
 # ensure that the sink works with log compaction enabled on the consistency topic
 
@@ -403,7 +411,12 @@ $ kafka-verify format=json sink=materialize.public.json_avro_upsert_key key=true
 $ kafka-verify format=json sink=materialize.public.json_avro_upsert_key_2 key=true
 {"b": 2} {"a": 1, "b": 2, "c": 3, "transaction": {"id": "0"}}
 
+# Temporarily disabled due to flakiness.
+# See: https://github.com/MaterializeInc/materialize/issues/10927
 # Verify compaction of exactly once sinks.
-$ verify-timestamp-compaction source=input_csv max-size=3 permit-progress=true
-$ verify-timestamp-compaction source=rt_binding_consistency_test_source max-size=3 permit-progress=true
-$ verify-timestamp-compaction source=input_kafka_dbz max-size=3 permit-progress=true
+# $ verify-timestamp-compaction source=input_csv max-size=3 permit-progress=true
+# $ verify-timestamp-compaction source=rt_binding_consistency_test_source max-size=3 permit-progress=true
+# $ verify-timestamp-compaction source=input_kafka_dbz max-size=3 permit-progress=true
+
+# TODO: enable when possible
+# $ verify-timestamp-compaction source=input_kafka_cdcv2 max-size=3 permit-progress=true

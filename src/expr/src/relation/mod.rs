@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -816,6 +817,14 @@ impl MirRelationExpr {
         }
     }
 
+    /// Append to each row a single `scalar`.
+    pub fn map_one(self, scalar: MirScalarExpr) -> Self {
+        MirRelationExpr::Map {
+            input: Box::new(self),
+            scalars: vec![scalar],
+        }
+    }
+
     /// Like `map`, but yields zero-or-more output rows per input row
     pub fn flat_map(self, func: TableFunc, exprs: Vec<MirScalarExpr>) -> Self {
         MirRelationExpr::FlatMap {
@@ -1145,9 +1154,13 @@ impl MirRelationExpr {
         self,
         id_gen: &mut IdGen,
         keys_and_values: MirRelationExpr,
-        default: Vec<(Datum, ColumnType)>,
+        default: Vec<(Datum, ScalarType)>,
     ) -> MirRelationExpr {
-        assert_eq!(keys_and_values.arity() - self.arity(), default.len());
+        let (data, column_types): (Vec<_>, Vec<_>) = default
+            .into_iter()
+            .map(|(datum, scalar_type)| (datum, scalar_type.nullable(datum.is_null())))
+            .unzip();
+        assert_eq!(keys_and_values.arity() - self.arity(), data.len());
         self.let_in(id_gen, |_id_gen, get_keys| {
             MirRelationExpr::join(
                 vec![
@@ -1170,8 +1183,8 @@ impl MirRelationExpr {
             // potential predicate pushdown and elision in the
             // optimizer.
             .product(MirRelationExpr::constant(
-                vec![default.iter().map(|(datum, _)| *datum).collect()],
-                RelationType::new(default.iter().map(|(_, typ)| typ.clone()).collect()),
+                vec![data],
+                RelationType::new(column_types),
             ))
         })
     }
@@ -1186,7 +1199,7 @@ impl MirRelationExpr {
         self,
         id_gen: &mut IdGen,
         keys_and_values: MirRelationExpr,
-        default: Vec<(Datum<'static>, ColumnType)>,
+        default: Vec<(Datum<'static>, ScalarType)>,
     ) -> MirRelationExpr {
         keys_and_values.let_in(id_gen, |id_gen, get_keys_and_values| {
             get_keys_and_values.clone().union(self.anti_lookup(
@@ -1203,6 +1216,13 @@ impl MirRelationExpr {
             input: Box::new(self),
             keys,
         }
+    }
+
+    /// True iff the expression contains a `NullaryFunc::MzLogicalTimestamp`.
+    pub fn contains_temporal(&mut self) -> bool {
+        let mut contains = false;
+        self.visit_scalars_mut(&mut |e| contains = contains || e.contains_temporal());
+        contains
     }
 
     /// Applies a fallible immutable `f` to each child of type `MirRelationExpr`.
@@ -2115,43 +2135,99 @@ impl RowSetFinishing {
             && self.offset == 0
             && self.project.iter().copied().eq(0..arity)
     }
-    /// Applies finishing actions to a row set.
-    pub fn finish(&self, rows: &mut Vec<Row>) {
+    /// Determines the index of the (Row, count) pair, and the
+    /// index into the count within that pair, corresponding to a particular offset.
+    ///
+    /// For example, if `self.offset` is 42, and `rows` is
+    /// `&[(_, 10), (_, 17), (_, 20), (_, 11)]`,
+    /// then this function will return `(2, 15)`, because after applying
+    /// the offset, we will start at the row/diff pair in position 2,
+    /// and skip 15 of the 20 rows that that entry represents.
+    fn find_offset(&self, rows: &[(Row, NonZeroUsize)]) -> (usize, usize) {
+        let mut offset_remaining = self.offset;
+        for (i, (_, count)) in rows.iter().enumerate() {
+            let count = count.get();
+            if count > offset_remaining {
+                return (i, offset_remaining);
+            }
+            offset_remaining -= count;
+        }
+        // The offset is past the end of the rows; we will
+        // return nothing.
+        (rows.len(), 0)
+    }
+    /// Applies finishing actions to a row set,
+    /// and unrolls it to a unary representation.
+    pub fn finish(&self, mut rows: Vec<(Row, NonZeroUsize)>) -> Vec<Row> {
         let mut left_datum_vec = mz_repr::DatumVec::new();
         let mut right_datum_vec = mz_repr::DatumVec::new();
-        let mut sort_by = |left: &Row, right: &Row| {
+        let sort_by = |(left, _): &(Row, _), (right, _): &(Row, _)| {
             let left_datums = left_datum_vec.borrow_with(left);
             let right_datums = right_datum_vec.borrow_with(right);
             compare_columns(&self.order_by, &left_datums, &right_datums, || {
                 left.cmp(&right)
             })
         };
-        let offset = self.offset;
-        if offset > rows.len() {
-            *rows = Vec::new();
-        } else {
-            if let Some(limit) = self.limit {
-                let offset_plus_limit = offset + limit;
-                if rows.len() > offset_plus_limit {
-                    pdqselect::select_by(rows, offset_plus_limit, &mut sort_by);
-                    rows.truncate(offset_plus_limit);
-                }
-            }
-            if offset > 0 {
-                pdqselect::select_by(rows, offset, &mut sort_by);
-                rows.drain(..offset);
-            }
-            rows.sort_by(&mut sort_by);
-            let mut row_packer = Row::default();
-            let mut datum_vec = mz_repr::DatumVec::new();
-            for row in rows.iter_mut() {
-                *row = {
-                    let datums = datum_vec.borrow_with(&row);
-                    row_packer.extend(self.project.iter().map(|i| &datums[*i]));
-                    row_packer.finish_and_reuse()
-                };
-            }
+        rows.sort_by(sort_by);
+
+        let (offset_nth_row, offset_kth_copy) = self.find_offset(&rows);
+
+        // Adjust the first returned row's count to account for the offset.
+        if let Some((_, nth_diff)) = rows.get_mut(offset_nth_row) {
+            // Justification for `unwrap`:
+            // we only get here if we return from `get_offset`
+            // having found something to return,
+            // which can only happen if the count of
+            // this row is greater than the offset remaining.
+            *nth_diff = NonZeroUsize::new(nth_diff.get() - offset_kth_copy).unwrap();
         }
+
+        let limit = self.limit.unwrap_or(std::usize::MAX);
+
+        // The code below is logically equivalent to:
+        //
+        // let mut total = 0;
+        // for (_, count) in &rows[offset_nth_row..] {
+        //     total += count.get();
+        // }
+        // let return_size = std::cmp::min(total, limit);
+        //
+        // but it breaks early if the limit is reached, instead of scanning the entire code.
+        let return_size = rows[offset_nth_row..]
+            .iter()
+            .try_fold(0, |sum, (_, count)| {
+                let new_sum = sum + count.get();
+                if new_sum > limit {
+                    None
+                } else {
+                    Some(new_sum)
+                }
+            })
+            .unwrap_or(limit);
+
+        let mut ret = Vec::with_capacity(return_size);
+        let mut remaining = limit;
+        let mut row_buf = Row::default();
+        let mut datum_vec = mz_repr::DatumVec::new();
+        for (row, count) in &rows[offset_nth_row..] {
+            if remaining == 0 {
+                break;
+            }
+            let count = std::cmp::min(count.get(), remaining);
+            for _ in 0..count {
+                let new_row = {
+                    let datums = datum_vec.borrow_with(&row);
+                    row_buf
+                        .packer()
+                        .extend(self.project.iter().map(|i| &datums[*i]));
+                    row_buf.clone()
+                };
+                ret.push(new_row);
+            }
+            remaining -= count;
+        }
+
+        ret
     }
 }
 

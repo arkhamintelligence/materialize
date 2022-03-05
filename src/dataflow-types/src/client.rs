@@ -24,8 +24,8 @@ use tracing::trace;
 
 use crate::logging::LoggingConfig;
 use crate::{
-    sources::MzOffset, sources::SourceConnector, DataflowDescription, PeekResponse,
-    SourceInstanceDesc, TailResponse, Update,
+    sources::{MzOffset, SourceDesc},
+    DataflowDescription, PeekResponse, SourceInstanceDesc, TailResponse, Update,
 };
 use mz_expr::{GlobalId, PartitionId, RowSetFinishing};
 use mz_repr::Row;
@@ -61,6 +61,7 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
     CreateInstance(Option<LoggingConfig>),
     /// Indicates the termination of an instance, and is the last command for its compute instance.
     DropInstance,
+
     /// Create a sequence of dataflows.
     ///
     /// Each of the dataflows must contain `as_of` members that are valid
@@ -69,11 +70,13 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
     /// Subsequent commands may arbitrarily compact the arrangements;
     /// the dataflow runners are responsible for ensuring that they can
     /// correctly maintain the dataflows.
-    CreateDataflows(Vec<DataflowDescription<crate::plan::Plan, T>>),
-    /// Drop the sinks bound to these names.
-    DropSinks(Vec<GlobalId>),
-    /// Drop the indexes bound to these namees.
-    DropIndexes(Vec<GlobalId>),
+    CreateDataflows(Vec<DataflowDescription<crate::plan::Plan<T>, T>>),
+    /// Enable compaction in compute-managed collections.
+    ///
+    /// Each entry in the vector names a collection and provides a frontier after which
+    /// accumulations must be correct. The workers gain the liberty of compacting
+    /// the corresponding maintained traces up through that frontier.
+    AllowCompaction(Vec<(GlobalId, Antichain<T>)>),
 
     /// Peek at an arrangement.
     ///
@@ -108,13 +111,6 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
         /// The identifier of the peek request to cancel.
         conn_id: u32,
     },
-    /// Enable compaction in views.
-    ///
-    /// Each entry in the vector names a view and provides a frontier after which
-    /// accumulations must be correct. The workers gain the liberty of compacting
-    /// the corresponding maintained traces up through that frontier.
-    // TODO: Could be called `AllowTraceCompaction` or `AllowArrangementCompaction`?
-    AllowIndexCompaction(Vec<(GlobalId, Antichain<T>)>),
 }
 
 impl ComputeCommandKind {
@@ -126,14 +122,25 @@ impl ComputeCommandKind {
             // TODO: This breaks metrics. Not sure that's a problem.
             ComputeCommandKind::CreateInstance => "create_instance",
             ComputeCommandKind::DropInstance => "drop_instance",
-            ComputeCommandKind::AllowIndexCompaction => "allow_index_compaction",
+            ComputeCommandKind::AllowCompaction => "allow_compute_compaction",
             ComputeCommandKind::CancelPeek => "cancel_peek",
             ComputeCommandKind::CreateDataflows => "create_dataflows",
-            ComputeCommandKind::DropIndexes => "drop_indexes",
-            ComputeCommandKind::DropSinks => "drop_sinks",
             ComputeCommandKind::Peek => "peek",
         }
     }
+}
+
+/// A command creating a single source
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSourceCommand<T> {
+    /// The source identifier
+    pub id: GlobalId,
+    /// The source description
+    pub desc: SourceDesc,
+    /// The initial `since` frontier
+    pub since: Antichain<T>,
+    /// Any previously stored timestamp bindings
+    pub ts_bindings: Vec<(PartitionId, T, crate::sources::MzOffset)>,
 }
 
 /// Commands related to the ingress and egress of collections.
@@ -145,22 +152,24 @@ impl ComputeCommandKind {
 )]
 pub enum StorageCommand<T = mz_repr::Timestamp> {
     /// Create the enumerated sources, each associated with its identifier.
-    ///
-    /// For each identifier, there is a source description and a valid `since` frontier.
-    CreateSources(Vec<(GlobalId, (crate::types::sources::SourceDesc, Antichain<T>))>),
+    CreateSources(Vec<CreateSourceCommand<T>>),
     /// Render the enumerated sources.
     ///
     /// Each source has a name for debugging purposes, an optional "as of" frontier and collection
     /// of sources to import.
     RenderSources(
         Vec<(
-            String,
-            Option<Antichain<T>>,
-            BTreeMap<GlobalId, SourceInstanceDesc>,
+            /* debug_name */ String,
+            /* dataflow_id */ GlobalId,
+            /* as_of */ Option<Antichain<T>>,
+            /* source_imports*/ BTreeMap<GlobalId, SourceInstanceDesc<T>>,
         )>,
     ),
-    /// Drop the sources bound to these names.
-    DropSources(Vec<GlobalId>),
+    /// Enable compaction in storage-managed collections.
+    ///
+    /// Each entry in the vector names a collection and provides a frontier after which
+    /// accumulations must be correct.
+    AllowCompaction(Vec<(GlobalId, Antichain<T>)>),
 
     /// Insert `updates` into the local input named `id`.
     Insert {
@@ -175,25 +184,6 @@ pub enum StorageCommand<T = mz_repr::Timestamp> {
     /// be exactly replayed across restarts (i.e. we can assign the same timestamps to
     /// all the same data)
     DurabilityFrontierUpdates(Vec<(GlobalId, Antichain<T>)>),
-    /// Add a new source to be aware of for timestamping.
-    AddSourceTimestamping {
-        /// The ID of the timestamped source
-        id: GlobalId,
-        /// The connector for the timestamped source.
-        connector: SourceConnector,
-        /// Previously stored timestamp bindings.
-        bindings: Vec<(PartitionId, T, crate::sources::MzOffset)>,
-    },
-    /// Enable compaction in sources.
-    ///
-    /// Each entry in the vector names a source and provides a frontier after which
-    /// accumulations must be correct.
-    AllowSourceCompaction(Vec<(GlobalId, Antichain<T>)>),
-    /// Drop all timestamping info for a source
-    DropSourceTimestamping {
-        /// The ID id of the formerly timestamped source.
-        id: GlobalId,
-    },
     /// Advance all local inputs to the given timestamp.
     AdvanceAllLocalInputs {
         /// The timestamp to advance to.
@@ -207,12 +197,9 @@ impl StorageCommandKind {
     /// Must remain unique over all variants of `Command`.
     pub fn metric_name(&self) -> &'static str {
         match self {
-            StorageCommandKind::AddSourceTimestamping => "add_source_timestamping",
             StorageCommandKind::AdvanceAllLocalInputs => "advance_all_local_inputs",
-            StorageCommandKind::DropSourceTimestamping => "drop_source_timestamping",
-            StorageCommandKind::AllowSourceCompaction => "allows_source_compaction",
+            StorageCommandKind::AllowCompaction => "allow_storage_compaction",
             StorageCommandKind::CreateSources => "create_sources",
-            StorageCommandKind::DropSources => "drop_sources",
             StorageCommandKind::DurabilityFrontierUpdates => "durability_frontier_updates",
             StorageCommandKind::Insert => "insert",
             StorageCommandKind::RenderSources => "render_sources",
@@ -264,6 +251,7 @@ impl<T: timely::progress::Timestamp> Command<T> {
                                 dependent_objects: dataflow.dependent_objects.clone(),
                                 as_of: dataflow.as_of.clone(),
                                 debug_name: dataflow.debug_name.clone(),
+                                id: dataflow.id,
                             });
                         }
                     }
@@ -293,6 +281,11 @@ impl<T: timely::progress::Timestamp> Command<T> {
     /// added to `cease` will uninstall frontier tracking.
     pub fn frontier_tracking(&self, start: &mut Vec<GlobalId>, cease: &mut Vec<GlobalId>) {
         match self {
+            Command::Storage(StorageCommand::CreateSources(sources)) => {
+                for source in sources.iter() {
+                    start.push(source.id);
+                }
+            }
             Command::Compute(ComputeCommand::CreateDataflows(dataflows), _instance) => {
                 for dataflow in dataflows.iter() {
                     for (sink_id, _) in dataflow.sink_exports.iter() {
@@ -303,21 +296,12 @@ impl<T: timely::progress::Timestamp> Command<T> {
                     }
                 }
             }
-            Command::Compute(ComputeCommand::DropIndexes(index_ids), _instance) => {
-                for id in index_ids.iter() {
-                    cease.push(*id);
+            Command::Compute(ComputeCommand::AllowCompaction(frontiers), _instance) => {
+                for (id, frontier) in frontiers.iter() {
+                    if frontier.is_empty() {
+                        cease.push(*id);
+                    }
                 }
-            }
-            Command::Compute(ComputeCommand::DropSinks(sink_ids), _instance) => {
-                for id in sink_ids.iter() {
-                    cease.push(*id);
-                }
-            }
-            Command::Storage(StorageCommand::AddSourceTimestamping { id, .. }) => {
-                start.push(*id);
-            }
-            Command::Storage(StorageCommand::DropSourceTimestamping { id }) => {
-                cease.push(*id);
             }
             Command::Compute(ComputeCommand::CreateInstance(logging), _instance) => {
                 if let Some(logging_config) = logging {
@@ -381,7 +365,9 @@ pub enum StorageResponse<T = mz_repr::Timestamp> {
 #[async_trait(?Send)]
 pub trait Client<T = mz_repr::Timestamp> {
     /// Sends a command to the dataflow server.
-    async fn send(&mut self, cmd: Command<T>);
+    ///
+    /// The command can error for various reasons.
+    async fn send(&mut self, cmd: Command<T>) -> Result<(), anyhow::Error>;
 
     /// Receives the next response from the dataflow server.
     ///
@@ -392,7 +378,7 @@ pub trait Client<T = mz_repr::Timestamp> {
 
 #[async_trait(?Send)]
 impl Client for Box<dyn Client> {
-    async fn send(&mut self, cmd: Command) {
+    async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
     async fn recv(&mut self) -> Option<Response> {
@@ -485,7 +471,7 @@ impl LocalClient {
 
 #[async_trait(?Send)]
 impl Client for LocalClient {
-    async fn send(&mut self, cmd: Command) {
+    async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
         trace!("SEND dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
@@ -511,6 +497,7 @@ pub mod partitioned {
     use timely::progress::{Antichain, ChangeBatch};
     use tracing::debug;
 
+    use crate::client::ComputeInstanceId;
     use crate::TailResponse;
 
     use super::{Client, ComputeResponse, StorageResponse};
@@ -539,12 +526,13 @@ pub mod partitioned {
 
     #[async_trait(?Send)]
     impl<C: Client> Client for Partitioned<C> {
-        async fn send(&mut self, cmd: Command) {
+        async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
             self.state.observe_command(&cmd);
             let cmd_parts = cmd.partition_among(self.shards.len());
             for (shard, cmd_part) in self.shards.iter_mut().zip(cmd_parts) {
-                shard.send(cmd_part).await;
+                shard.send(cmd_part).await?;
             }
+            Ok(())
         }
 
         async fn recv(&mut self) -> Option<Response> {
@@ -573,27 +561,24 @@ pub mod partitioned {
     /// This exists so we can consolidate rows and
     /// sort them by timestamp before passing them to the consumer
     /// (currently, coord.rs).
-    struct PendingTail {
+    struct PendingTail<T> {
         /// `frontiers[i]` is an antichain representing the times at which we may
         /// still receive results from worker `i`.
-        frontiers: HashMap<usize, Antichain<Timestamp>>,
+        frontiers: HashMap<usize, Antichain<T>>,
         /// Consolidated frontiers
-        change_batch: ChangeBatch<Timestamp>,
+        change_batch: ChangeBatch<T>,
         /// The results (possibly unsorted) which have not yet been delivered.
-        buffer: Vec<(Timestamp, Row, Diff)>,
+        buffer: Vec<(T, Row, Diff)>,
         /// The number of unique shard IDs expected.
         parts: usize,
         /// The last progress message that has been reported to the consumer.
-        reported_frontier: Antichain<Timestamp>,
+        reported_frontier: Antichain<T>,
     }
 
-    impl PendingTail {
+    impl<T: timely::progress::Timestamp + Copy> PendingTail<T> {
         /// Return all the updates with time less than `upper`,
         /// in sorted and consolidated representation.
-        pub fn consolidate_up_to(
-            &mut self,
-            upper: Antichain<Timestamp>,
-        ) -> Vec<(Timestamp, Row, Diff)> {
+        pub fn consolidate_up_to(&mut self, upper: Antichain<T>) -> Vec<(T, Row, Diff)> {
             differential_dataflow::consolidation::consolidate_updates(&mut self.buffer);
             let split_point = self
                 .buffer
@@ -601,15 +586,15 @@ pub mod partitioned {
             self.buffer.drain(0..split_point).collect()
         }
 
-        pub fn push_data<I: IntoIterator<Item = (Timestamp, Row, Diff)>>(&mut self, data: I) {
+        pub fn push_data<I: IntoIterator<Item = (T, Row, Diff)>>(&mut self, data: I) {
             self.buffer.extend(data);
         }
 
         pub fn record_progress(
             &mut self,
             shard_id: usize,
-            progress: Antichain<Timestamp>,
-        ) -> Option<Antichain<Timestamp>> {
+            progress: Antichain<T>,
+        ) -> Option<Antichain<T>> {
             // In the future, we can probably replace all this logic with the use of a `MutableAntichain`.
             // We would need to have the tail workers report both their old frontier and their new frontier, rather
             // than just the latter. But this will all be subsumed anyway by the proposed refactor to make TAILs
@@ -664,9 +649,11 @@ pub mod partitioned {
     ///
     /// This helper type unifies the responses of multiple partitioned
     /// workers in order to present as a single worker.
-    pub struct PartitionedClientState {
+    pub struct PartitionedClientState<T = mz_repr::Timestamp> {
         /// Upper frontiers for indexes, sources, and sinks.
-        uppers: HashMap<GlobalId, MutableAntichain<Timestamp>>,
+        ///
+        /// The `Option<ComputeInstanceId>` uses `None` to represent Storage.
+        uppers: HashMap<(GlobalId, Option<ComputeInstanceId>), MutableAntichain<T>>,
         /// Pending responses for a peek; returnable once all are available.
         peek_responses: HashMap<u32, HashMap<usize, PeekResponse>>,
         /// Number of parts the state machine represents.
@@ -676,9 +663,11 @@ pub mod partitioned {
         ///
         /// `None` is a sentinel value indicating that the tail has been dropped and no
         /// further messages should be forwarded.
-        pending_tails: HashMap<GlobalId, Option<PendingTail>>,
+        ///
+        /// The `Option<ComputeInstanceId>` uses `None` to represent Storage.
+        pending_tails: HashMap<(GlobalId, Option<ComputeInstanceId>), Option<PendingTail<T>>>,
         /// The next responses to return immediately, if any
-        stashed_responses: Fuse<Box<dyn Iterator<Item = Response> + Send>>,
+        stashed_responses: Fuse<Box<dyn Iterator<Item = Response<T>> + Send>>,
     }
 
     impl PartitionedClientState {
@@ -702,6 +691,11 @@ pub mod partitioned {
             // Temporary storage for identifiers to add to and remove from frontier tracking.
             let mut start = Vec::new();
             let mut cease = Vec::new();
+            let instance = if let Command::Compute(_, instance) = command {
+                Some(*instance)
+            } else {
+                None
+            };
             command.frontier_tracking(&mut start, &mut cease);
             // Apply the determined effects of the command to `self.uppers`.
             for id in start.into_iter() {
@@ -710,11 +704,11 @@ pub mod partitioned {
                     <Timestamp as timely::progress::Timestamp>::minimum(),
                     self.parts as i64,
                 )));
-                let previous = self.uppers.insert(id, frontier);
+                let previous = self.uppers.insert((id, instance), frontier);
                 assert!(previous.is_none(), "Protocol error: starting frontier tracking for already present identifier {:?} due to command {:?}", id, command);
             }
             for id in cease.into_iter() {
-                let previous = self.uppers.remove(&id);
+                let previous = self.uppers.remove(&(id, instance));
                 if previous.is_none() {
                     debug!("Protocol error: ceasing frontier tracking for absent identifier {:?} due to command {:?}", id, command);
                 }
@@ -729,9 +723,8 @@ pub mod partitioned {
         ) -> Box<dyn Iterator<Item = Response> + Send> {
             match message {
                 Response::Compute(ComputeResponse::FrontierUppers(mut list), instance) => {
-                    assert_eq!(instance, super::DEFAULT_COMPUTE_INSTANCE_ID);
                     for (id, changes) in list.iter_mut() {
-                        if let Some(frontier) = self.uppers.get_mut(id) {
+                        if let Some(frontier) = self.uppers.get_mut(&(*id, Some(instance))) {
                             let iter = frontier.update_iter(changes.drain());
                             changes.extend(iter);
                         } else {
@@ -762,13 +755,25 @@ pub mod partitioned {
                 // Avoid multiple retractions of minimum time, to present as updates from one worker.
                 Response::Storage(StorageResponse::TimestampBindings(mut feedback)) => {
                     for (id, changes) in feedback.changes.iter_mut() {
-                        if let Some(frontier) = self.uppers.get_mut(id) {
+                        if let Some(frontier) = self.uppers.get_mut(&(*id, None)) {
                             let iter = frontier.update_iter(changes.drain());
                             changes.extend(iter);
                         } else {
                             changes.clear();
                         }
                     }
+                    // The following block implements a `list.retain()` of non-empty change batches.
+                    // This is more verbose than `list.retain()` because that method cannot mutate
+                    // its argument, and `is_empty()` may need to do this (as it is lazily compacted).
+                    let mut cursor = 0;
+                    while let Some((_id, changes)) = feedback.changes.get_mut(cursor) {
+                        if changes.is_empty() {
+                            feedback.changes.swap_remove(cursor);
+                        } else {
+                            cursor += 1;
+                        }
+                    }
+
                     Box::new(
                         Some(Response::Storage(StorageResponse::TimestampBindings(
                             feedback,
@@ -815,15 +820,18 @@ pub mod partitioned {
                     }
                 }
                 Response::Compute(ComputeResponse::TailResponse(id, response), instance) => {
-                    let maybe_entry = self.pending_tails.entry(id).or_insert_with(|| {
-                        Some(PendingTail {
-                            frontiers: HashMap::new(),
-                            change_batch: Default::default(),
-                            buffer: Vec::new(),
-                            parts: self.parts,
-                            reported_frontier: Antichain::from_elem(0),
-                        })
-                    });
+                    let maybe_entry = self
+                        .pending_tails
+                        .entry((id, Some(instance)))
+                        .or_insert_with(|| {
+                            Some(PendingTail {
+                                frontiers: HashMap::new(),
+                                change_batch: Default::default(),
+                                buffer: Vec::new(),
+                                parts: self.parts,
+                                reported_frontier: Antichain::from_elem(0),
+                            })
+                        });
 
                     let entry = match maybe_entry {
                         None => {
@@ -911,11 +919,12 @@ pub mod process_local {
 
     #[async_trait(?Send)]
     impl Client for ProcessLocal {
-        async fn send(&mut self, cmd: Command) {
+        async fn send(&mut self, cmd: Command) -> Result<(), anyhow::Error> {
             self.worker_tx
                 .send(cmd)
                 .expect("worker command receiver should not drop first");
             self.worker_thread.unpark();
+            Ok(())
         }
 
         async fn recv(&mut self) -> Option<Response> {

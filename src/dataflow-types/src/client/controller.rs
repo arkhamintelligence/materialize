@@ -7,7 +7,20 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! A client that maintains summaries of the involved objects.
+//! A representative of STORAGE and COMPUTE that maintains summaries of the involved objects.
+//!
+//! The `Controller` provides the ability to create and manipulate storage and compute instances.
+//! Each of Storage and Compute provide their own controllers, accessed through the `storage()`
+//! and `compute(instance_id)` methods. It is an error to access a compute instance before it has
+//! been created; a single storage instance is always available.
+//!
+//! The controller also provides a `recv()` method that returns responses from the storage and
+//! compute layers, which may remain of value to the interested user. With time, these responses
+//! may be thinned down in an effort to make the controller more self contained.
+//!
+//! Consult the `StorageController` and `ComputeController` documentation for more information
+//! about each of these interfaces.
+
 use std::collections::BTreeMap;
 
 use differential_dataflow::lattice::Lattice;
@@ -40,7 +53,7 @@ where
         &mut self,
         instance: ComputeInstanceId,
         logging: Option<LoggingConfig>,
-    ) {
+    ) -> Result<(), anyhow::Error> {
         self.compute
             .insert(instance, compute::ComputeControllerState::new(&logging));
         self.client
@@ -48,13 +61,16 @@ where
                 ComputeCommand::CreateInstance(logging),
                 instance,
             ))
-            .await;
+            .await
     }
-    pub async fn drop_instance(&mut self, instance: ComputeInstanceId) {
+    pub async fn drop_instance(
+        &mut self,
+        instance: ComputeInstanceId,
+    ) -> Result<(), anyhow::Error> {
         self.compute.remove(&instance);
         self.client
             .send(Command::Compute(ComputeCommand::DropInstance, instance))
-            .await;
+            .await
     }
 }
 
@@ -94,7 +110,7 @@ impl<C: Client<T>, T: Timestamp + Lattice> Controller<C, T> {
                             .expect("Reference to absent instance")
                             .collection_mut(*id)
                             .expect("Reference to absent collection")
-                            .upper_frontier
+                            .write_frontier
                             .update_iter(changes.clone().drain());
                     }
                 }

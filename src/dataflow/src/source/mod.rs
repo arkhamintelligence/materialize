@@ -11,9 +11,8 @@
 
 use mz_avro::types::Value;
 use mz_dataflow_types::sources::AwsExternalId;
-use mz_dataflow_types::{DataflowError, DecodeError, SourceErrorDetails};
+use mz_dataflow_types::{DecodeError, SourceErrorDetails};
 use mz_persist::client::{StreamReadHandle, StreamWriteHandle};
-use mz_persist::indexed::Snapshot;
 use mz_persist::operators::stream::Persist;
 use mz_persist_types::Codec;
 use mz_repr::MessagePayload;
@@ -94,8 +93,6 @@ const YIELD_INTERVAL: Duration = Duration::from_millis(10);
 pub struct SourceConfig<'a, G> {
     /// The name to attach to the underlying timely operator.
     pub name: String,
-    /// The name of the SQL object this source corresponds to
-    pub sql_name: String,
     /// The name of the upstream resource this source corresponds to
     /// (For example, a Kafka topic)
     pub upstream_name: Option<String>,
@@ -139,28 +136,14 @@ where
     pub key: K,
     /// The record's value
     pub value: V,
-    /// The position in the source, if such a concept exists (e.g., Kafka offset, file line number)
-    pub position: Option<i64>,
+    /// The position in the partition described by the `partition` in the source
+    /// (e.g., Kafka offset, file line number, monotonic increasing
+    /// number, etc.)
+    pub position: i64,
     /// The time the record was created in the upstream systsem, as milliseconds since the epoch
     pub upstream_time_millis: Option<i64>,
     /// The partition of this message, present iff the partition comes from Kafka
     pub partition: PartitionId,
-}
-
-/// The data that we send from Upsert to the decode process
-#[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
-pub(crate) struct SourceData {
-    /// The actual value
-    pub(crate) value: Option<Result<Row, DataflowError>>,
-    /// The source's reported position for this record
-    ///
-    /// e.g. kafka offset or file location
-    pub(crate) position: Option<i64>,
-
-    /// The time that the upstream source believes that the message was created
-    ///
-    /// Currently only applies to Kafka
-    pub(crate) upstream_time_millis: Option<i64>,
 }
 
 /// The output of the decoding operator
@@ -171,7 +154,7 @@ pub struct DecodeResult {
     /// The decoded value
     pub value: Option<Result<Row, DecodeError>>,
     /// The index of the decoded value in the stream
-    pub position: Option<i64>,
+    pub position: i64,
     /// The time the record was created in the upstream systsem, as milliseconds since the epoch
     pub upstream_time_millis: Option<i64>,
     /// The partition this record came from
@@ -202,7 +185,7 @@ where
     pub fn new(
         key: K,
         value: V,
-        position: Option<i64>,
+        position: i64,
         upstream_time_millis: Option<i64>,
         partition: PartitionId,
     ) -> SourceOutput<K, V> {
@@ -245,13 +228,7 @@ where
     where
         V: Hashable<Output = u64>,
     {
-        Exchange::new(|x: &Self| {
-            if let Some(position) = x.position {
-                position.hashed()
-            } else {
-                x.value.hashed()
-            }
-        })
+        Exchange::new(|x: &Self| x.position.hashed())
     }
 }
 
@@ -925,7 +902,6 @@ where
 {
     let SourceConfig {
         name,
-        sql_name,
         upstream_name,
         id,
         scope,
@@ -964,7 +940,7 @@ where
 
                 let timestamp_histories = timestamp_histories.as_mut().ok_or_else(|| {
                     SourceError::new(
-                        sql_name.clone(),
+                        id,
                         SourceErrorDetails::Persistence("missing timestamp histories".to_owned()),
                     )
                 });
@@ -972,7 +948,7 @@ where
                 let result = timestamp_histories.and_then(|timestamp_histories| {
                 let (mut valid_bindings, mut retractions) = source_persist.restore().map_err(|e| {
                     SourceError::new(
-                        sql_name.clone(),
+                        id,
                         SourceErrorDetails::Persistence(format!(
                             "restoring timestamp bindings: {}",
                             e
@@ -1274,14 +1250,13 @@ where
         }
     });
 
-    let sql_name_for_error = sql_name.clone();
     let (ok_stream, err_stream) = stream.map_fallible("SourceErrorDemux", move |r| {
-        r.map_err(|e| SourceError::new(sql_name_for_error.clone(), SourceErrorDetails::FileIO(e)))
+        r.map_err(|e| SourceError::new(id, SourceErrorDetails::FileIO(e)))
     });
 
     let (ts_bindings_stream, ts_bindings_err_stream) = if let Some(source_persist) = source_persist
     {
-        source_persist.render_persistence_operators(sql_name, ts_bindings_stream)
+        source_persist.render_persistence_operators(id, ts_bindings_stream)
     } else {
         (ts_bindings_stream, operator::empty(scope))
     };
@@ -1433,7 +1408,7 @@ impl SourceReaderPersistence {
     /// eventually.
     fn render_persistence_operators<G>(
         &self,
-        source_name: String,
+        source_id: SourceInstanceId,
         ts_bindings_stream: Stream<G, ((SourceTimestamp, AssignedTimestamp), Timestamp, Diff)>,
     ) -> (
         Stream<G, ((SourceTimestamp, AssignedTimestamp), Timestamp, Diff)>,
@@ -1451,7 +1426,7 @@ impl SourceReaderPersistence {
         // `persist()`. We have to do this because sources currently only emit a `Stream<_,
         // SourceError>`. In practice, persist errors are non-retractable, currently.
         let ts_bindings_persist_err = ts_bindings_persist_err.map(move |(error, _ts, _diff)| {
-            SourceError::new(source_name.clone(), SourceErrorDetails::Persistence(error))
+            SourceError::new(source_id, SourceErrorDetails::Persistence(error))
         });
 
         (ts_bindings_stream, ts_bindings_persist_err)
@@ -1578,7 +1553,7 @@ fn handle_message<S: SourceReader>(
     output.session(&ts_cap).give(Ok(SourceOutput::new(
         key,
         out,
-        Some(offset.offset),
+        offset.offset,
         message.upstream_time_millis,
         message.partition,
     )));

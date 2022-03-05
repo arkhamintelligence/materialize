@@ -170,6 +170,8 @@ contains:column "a" is of type integer but expression is of type text
 # ...but not when impossible.
 ! INSERT INTO t VALUES (DATE '2020-01-01', 'bad')
 contains:column "a" is of type integer but expression is of type date
+! INSERT INTO t (b, a) VALUES ('bad', DATE '2020-01-01')
+contains:column "a" is of type integer but expression is of type date
 
 # Attempting to insert JSON into an int column is particularly interesting.
 # While there is an "explicit" cast from `jsonb` to `int`, there is no
@@ -199,10 +201,13 @@ contains:null value in column "a" violates not-null constraint
 > INSERT INTO v VALUES (now());
 
 ! CREATE INDEX ON v (now())
-contains:now cannot be used in static queries
+contains:cannot materialize call to current_timestamp
 
 ! CREATE INDEX ON v (mz_logical_timestamp())
-contains:calls to mz_logical_timestamp in in static or write queries are not supported
+contains:cannot materialize call to mz_logical_timestamp
+
+! CREATE INDEX ON v (mz_version())
+contains:cannot materialize call to mz_version
 
 > DROP TABLE IF EXISTS s;
 

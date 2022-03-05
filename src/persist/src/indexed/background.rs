@@ -21,10 +21,11 @@ use tokio::runtime::Runtime as AsyncRuntime;
 use mz_ore::task::RuntimeExt;
 
 use crate::error::Error;
+use crate::gen::persist::ProtoBatchFormat;
 use crate::indexed::arrangement::Arrangement;
 use crate::indexed::cache::{BlobCache, CacheHint};
 use crate::indexed::columnar::ColumnarRecordsVec;
-use crate::indexed::encoding::{BlobTraceBatch, TraceBatchMeta, UnsealedSnapshotMeta};
+use crate::indexed::encoding::{BlobTraceBatchPart, TraceBatchMeta, UnsealedSnapshotMeta};
 use crate::indexed::metrics::Metrics;
 use crate::pfuture::PFuture;
 use crate::storage::{Blob, BlobRead};
@@ -160,16 +161,25 @@ impl<B: Blob> Maintainer<B> {
         );
 
         let mut updates = vec![];
+        let mut batches = vec![];
 
-        let first_batch = blob
-            .get_trace_batch_async(&first.key, CacheHint::NeverAdd)
-            .recv()?;
-        updates.extend(first_batch.updates.iter().flat_map(|u| u.iter()));
+        for key in first.keys.iter() {
+            batches.push(
+                blob.get_trace_batch_async(key, CacheHint::NeverAdd)
+                    .recv()?,
+            );
+        }
 
-        let second_batch = blob
-            .get_trace_batch_async(&second.key, CacheHint::NeverAdd)
-            .recv()?;
-        updates.extend(second_batch.updates.iter().flat_map(|u| u.iter()));
+        for key in second.keys.iter() {
+            batches.push(
+                blob.get_trace_batch_async(key, CacheHint::NeverAdd)
+                    .recv()?,
+            );
+        }
+
+        for batch in batches.iter() {
+            updates.extend(batch.updates.iter().flat_map(|u| u.iter()));
+        }
 
         for ((_, _), ts, _) in updates.iter_mut() {
             ts.advance_by(desc.since().borrow());
@@ -178,13 +188,15 @@ impl<B: Blob> Maintainer<B> {
         differential_dataflow::consolidation::consolidate_updates(&mut updates);
 
         let updates = updates.iter().collect::<ColumnarRecordsVec>().into_inner();
-        let new_batch = BlobTraceBatch {
+        let new_batch = BlobTraceBatchPart {
             desc: desc.clone(),
+            index: 0,
             updates,
         };
 
         let merged_key = Arrangement::new_blob_key();
-        let (format, size_bytes) = blob.set_trace_batch(merged_key.clone(), new_batch)?;
+        let format = ProtoBatchFormat::ParquetKvtd;
+        let size_bytes = blob.set_trace_batch(merged_key.clone(), new_batch, format)?;
 
         // Only upgrade the compaction level if we know this new batch represents
         // an increase in data over both of its parents so that we know we need
@@ -197,7 +209,7 @@ impl<B: Blob> Maintainer<B> {
         };
 
         let merged = TraceBatchMeta {
-            key: merged_key,
+            keys: vec![merged_key],
             format,
             desc,
             level: merged_level,
@@ -244,8 +256,9 @@ mod tests {
         );
         let maintainer = Maintainer::new(blob.clone(), async_runtime, metrics);
 
-        let b0 = BlobTraceBatch {
+        let b0 = BlobTraceBatchPart {
             desc: desc_from(0, 1, 0),
+            index: 0,
             updates: vec![
                 (("k".as_bytes(), "v".as_bytes()), 0, 1),
                 (("k2".as_bytes(), "v2".as_bytes()), 0, 1),
@@ -254,10 +267,12 @@ mod tests {
             .collect::<ColumnarRecordsVec>()
             .into_inner(),
         };
-        let (b0_format, b0_size_bytes) = blob.set_trace_batch("b0".into(), b0.clone())?;
+        let format = ProtoBatchFormat::ParquetKvtd;
+        let b0_size_bytes = blob.set_trace_batch("b0".into(), b0.clone(), format)?;
 
-        let b1 = BlobTraceBatch {
+        let b1 = BlobTraceBatchPart {
             desc: desc_from(1, 3, 0),
+            index: 0,
             updates: vec![
                 (("k".as_bytes(), "v".as_bytes()), 2, 1),
                 (("k3".as_bytes(), "v3".as_bytes()), 2, 1),
@@ -266,19 +281,19 @@ mod tests {
             .collect::<ColumnarRecordsVec>()
             .into_inner(),
         };
-        let (b1_format, b1_size_bytes) = blob.set_trace_batch("b1".into(), b1.clone())?;
+        let b1_size_bytes = blob.set_trace_batch("b1".into(), b1.clone(), format)?;
 
         let req = CompactTraceReq {
             b0: TraceBatchMeta {
-                key: "b0".into(),
-                format: b0_format,
+                keys: vec!["b0".into()],
+                format,
                 desc: b0.desc,
                 level: 0,
                 size_bytes: b0_size_bytes,
             },
             b1: TraceBatchMeta {
-                key: "b1".into(),
-                format: b1_format,
+                keys: vec!["b1".into()],
+                format,
                 desc: b1.desc,
                 level: 0,
                 size_bytes: b1_size_bytes,
@@ -289,7 +304,7 @@ mod tests {
         let expected_res = CompactTraceRes {
             req: req.clone(),
             merged: TraceBatchMeta {
-                key: "MERGED_KEY".into(),
+                keys: vec!["MERGED_KEY".into()],
                 format: ProtoBatchFormat::ParquetKvtd,
                 desc: desc_from(0, 3, 2),
                 level: 1,
@@ -297,24 +312,34 @@ mod tests {
             },
         };
         let mut res = maintainer.compact_trace(req).recv()?;
-        let merged_key = res.merged.key.clone();
-        res.merged.key = "MERGED_KEY".into();
+
+        // Grab the list of newly created trace batch keys so we can check the
+        // contents of the merged batch.
+        let merged_keys = res.merged.keys.clone();
+        // Replace the list of keys with a known set of keys so that we can assert
+        // on the trace batch metadata.
+        res.merged.keys = vec!["MERGED_KEY".into()];
         res.merged.size_bytes = 0;
         assert_eq!(res, expected_res);
 
-        let b2 = blob
-            .get_trace_batch_async(&merged_key, CacheHint::MaybeAdd)
-            .recv()?;
+        let mut updates = vec![];
+        for key in merged_keys {
+            let batch_part = blob
+                .get_trace_batch_async(&key, CacheHint::MaybeAdd)
+                .recv()?;
+            assert_eq!(&batch_part.desc, &expected_res.merged.desc);
+            updates.extend(batch_part.updates.iter().flat_map(|u| {
+                u.iter()
+                    .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), t, d))
+            }));
+        }
+
         let expected_updates = vec![
-            (("k".as_bytes(), "v".as_bytes()), 2, 2),
-            (("k2".as_bytes(), "v2".as_bytes()), 2, 1),
-            (("k3".as_bytes(), "v3".as_bytes()), 2, 1),
+            (("k".as_bytes().to_vec(), "v".as_bytes().to_vec()), 2, 2),
+            (("k2".as_bytes().to_vec(), "v2".as_bytes().to_vec()), 2, 1),
+            (("k3".as_bytes().to_vec(), "v3".as_bytes().to_vec()), 2, 1),
         ];
-        assert_eq!(&b2.desc, &expected_res.merged.desc);
-        assert_eq!(
-            &b2.updates.iter().flat_map(|u| u.iter()).collect::<Vec<_>>(),
-            &expected_updates
-        );
+        assert_eq!(updates, expected_updates);
         Ok(())
     }
 
@@ -334,14 +359,14 @@ mod tests {
         // Non-contiguous batch descs
         let req = CompactTraceReq {
             b0: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 2, 0),
                 level: 0,
                 size_bytes: 0,
             },
             b1: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(3, 4, 0),
                 level: 0,
@@ -349,19 +374,19 @@ mod tests {
             },
             since: Antichain::from_elem(0),
         };
-        assert_eq!(maintainer.compact_trace(req).recv(), Err(Error::from("invalid merge of non-consecutive batches TraceBatchMeta { key: \"\", format: Unknown, desc: Description { lower: Antichain { elements: [0] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 } and TraceBatchMeta { key: \"\", format: Unknown, desc: Description { lower: Antichain { elements: [3] }, upper: Antichain { elements: [4] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 }")));
+        assert_eq!(maintainer.compact_trace(req).recv(), Err(Error::from("invalid merge of non-consecutive batches TraceBatchMeta { keys: [], format: Unknown, desc: Description { lower: Antichain { elements: [0] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 } and TraceBatchMeta { keys: [], format: Unknown, desc: Description { lower: Antichain { elements: [3] }, upper: Antichain { elements: [4] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 }")));
 
         // Overlapping batch descs
         let req = CompactTraceReq {
             b0: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 2, 0),
                 level: 0,
                 size_bytes: 0,
             },
             b1: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(1, 4, 0),
                 level: 0,
@@ -369,19 +394,19 @@ mod tests {
             },
             since: Antichain::from_elem(0),
         };
-        assert_eq!(maintainer.compact_trace(req).recv(), Err(Error::from("invalid merge of non-consecutive batches TraceBatchMeta { key: \"\", format: Unknown, desc: Description { lower: Antichain { elements: [0] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 } and TraceBatchMeta { key: \"\", format: Unknown, desc: Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [4] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 }")));
+        assert_eq!(maintainer.compact_trace(req).recv(), Err(Error::from("invalid merge of non-consecutive batches TraceBatchMeta { keys: [], format: Unknown, desc: Description { lower: Antichain { elements: [0] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 } and TraceBatchMeta { keys: [], format: Unknown, desc: Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [4] }, since: Antichain { elements: [0] } }, level: 0, size_bytes: 0 }")));
 
         // Since not at or in advance of b0's since
         let req = CompactTraceReq {
             b0: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 2, 1),
                 level: 0,
                 size_bytes: 0,
             },
             b1: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(2, 4, 0),
                 level: 0,
@@ -394,14 +419,14 @@ mod tests {
         // Since not at or in advance of b1's since
         let req = CompactTraceReq {
             b0: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(0, 2, 0),
                 level: 0,
                 size_bytes: 0,
             },
             b1: TraceBatchMeta {
-                key: "".into(),
+                keys: vec![],
                 format: ProtoBatchFormat::Unknown,
                 desc: desc_from(2, 4, 1),
                 level: 0,

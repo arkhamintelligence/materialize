@@ -85,9 +85,9 @@ impl TypeCategory {
     /// GROUP BY typcategory
     /// ORDER BY typcategory;
     /// ```
-    fn from_type(typ: &ScalarType) -> Self {
+    pub fn from_type(typ: &ScalarType) -> Self {
         match typ {
-            ScalarType::Array(..) => Self::Array,
+            ScalarType::Array(..) | ScalarType::Int2Vector => Self::Array,
             ScalarType::Bool => Self::Bool,
             ScalarType::Bytes | ScalarType::Jsonb | ScalarType::Uuid => Self::UserDefined,
             ScalarType::Date
@@ -114,7 +114,7 @@ impl TypeCategory {
         }
     }
 
-    fn from_param(param: &ParamType) -> Self {
+    pub fn from_param(param: &ParamType) -> Self {
         match param {
             ParamType::Any
             | ParamType::ArrayAny
@@ -135,7 +135,7 @@ impl TypeCategory {
     /// WHERE typispreferred = true
     /// ORDER BY typcategory;
     /// ```
-    fn preferred_type(&self) -> Option<ScalarType> {
+    pub fn preferred_type(&self) -> Option<ScalarType> {
         match self {
             Self::Array | Self::List | Self::Pseudo | Self::UserDefined => None,
             Self::Bool => Some(ScalarType::Bool),
@@ -535,12 +535,13 @@ impl ParamList {
     /// parameter list.
     ///
     /// Polymorphic type consistency constraints include:
-    /// - All arguments passed to `ArrayAny` must be `ScalarType::Array`s with
-    ///   the same types of elements. All arguments passed to `ArrayElementAny`
+    /// - All arguments passed to `ArrayAny` must be equivalent
+    ///   `ScalarType::Array`s with the same types of elements. All arguments
+    ///   passed to `ArrayElementAny` must also be of these elements' type.
+    ///   Note that equivalent includes types like `Int2Vector`.
+    /// - All arguments passed to `ListAny` must be `ScalarType::List`s with
+    ///   the same types of elements. All arguments passed to `ListElementAny`
     ///   must also be of these elements' type.
-    /// - All arguments passed to `ListAny` must be `ScalarType::List`s with the
-    ///   same types of elements. All arguments passed to `ListElementAny` must
-    ///   also be of these elements' type.
     /// - All arguments passed to `MapAny` must be `ScalarType::Map`s with the
     ///   same type of value in each key, value pair.
     ///
@@ -603,8 +604,8 @@ impl ParamList {
     ///
     /// For example if you `list_append(int4 list list, custom_int4_list)`, the
     /// resulant type will be complex: its `custom_oid` will be `None`, but its
-    /// embedded element will be the custom element type, i.e. `custom_int4_list
-    /// list`).
+    /// embedded element will be the custom element type, i.e.
+    /// `custom_int4_list list`).
     ///
     /// However, it's also important to note that a complex value whose
     /// `custom_oid` is `None` are still considered complex if its embedded
@@ -620,11 +621,12 @@ impl ParamList {
     ///
     /// We will not coerce `int4_list_custom list` to
     /// `int4_list_list_custom`––only built-in types are ever coerced into
-    /// custom types. It's also trivial for users to add a cast to ensure custom
-    /// type consistency.
+    /// custom types. It's also trivial for users to add a cast to ensure
+    /// custom type consistency.
     fn resolve_polymorphic_types(&self, typs: &[Option<ScalarType>]) -> Option<ScalarType> {
         // Determines if types have the same [`ScalarBaseType`], and if complex
         // types' elements do, as well.
+        // TODO: This shouldn't test equality; it should find the best common type.
         fn complex_base_eq(l: &ScalarType, r: &ScalarType) -> bool {
             match (l, r) {
                 (ScalarType::Array(l), ScalarType::Array(r))
@@ -639,6 +641,8 @@ impl ParamList {
                 | (ScalarType::Map { value_type: l, .. }, ScalarType::Map { value_type: r, .. }) => {
                     complex_base_eq(l, r)
                 }
+                (ScalarType::Int2Vector, ScalarType::Array(el))
+                | (ScalarType::Array(el), ScalarType::Int2Vector) => **el == ScalarType::Int16,
                 (l, r) => ScalarBaseType::from(l) == ScalarBaseType::from(r),
             }
         }
@@ -652,7 +656,14 @@ impl ParamList {
             let param = &self[i];
             match (param, typ, &mut constrained_type) {
                 (ParamType::ArrayAny, Some(typ), None) => {
-                    constrained_type = Some(typ.clone());
+                    constrained_type = Some(match typ {
+                        // All polymorphic inputs get cast to the constrained
+                        // type. Because you can cast `int2vector` to `int2[]`
+                        // but not the other way around, `int2vector` must be
+                        // rewritten to `int2[]`.
+                        ScalarType::Int2Vector => ScalarType::Array(Box::new(ScalarType::Int16)),
+                        other => other.clone(),
+                    });
                 }
                 (ParamType::ArrayAny, Some(typ), Some(constrained)) => {
                     if !complex_base_eq(typ, constrained) {
@@ -733,6 +744,20 @@ impl ParamList {
                         return None;
                     }
                 }
+                (ParamType::RecordAny, Some(t @ ScalarType::Record { .. }), None) => {
+                    constrained_type = Some(t.clone());
+                }
+                (
+                    ParamType::RecordAny,
+                    Some(ScalarType::Record { .. }),
+                    Some(t @ ScalarType::Record { .. }),
+                ) => {
+                    // We can directly return the scalar type here without further checks.
+                    // Record type functions will attempt to cast the second param into
+                    // the type of the first. If the record cannot be cast, it will error
+                    // out then
+                    return Some(t.clone());
+                }
                 // These checks don't need to be more exhaustive (e.g. failing
                 // if arguments passed to `ListAny` are not `ScalarType::List`)
                 // because we've already done general type checking in
@@ -740,6 +765,7 @@ impl ParamList {
                 _ => {}
             }
         }
+
         constrained_type
     }
 
@@ -851,13 +877,13 @@ impl ParamType {
         use ScalarType::*;
 
         match self {
-            ArrayAny => matches!(t, Array(..)),
+            ArrayAny => matches!(t, Array(..) | Int2Vector),
             ListAny => matches!(t, List { .. }),
             Any | ArrayElementAny | ListElementAny => true,
             NonVecAny => !t.is_vec(),
             MapAny => matches!(t, Map { .. }),
-            Plain(to) => typeconv::can_cast(ecx, CastContext::Implicit, t.clone(), to.clone()),
-            RecordAny => unreachable!("not yet supported for input"),
+            Plain(to) => typeconv::can_cast(ecx, CastContext::Implicit, t, to),
+            RecordAny => matches!(t, Record { .. }),
         }
     }
 
@@ -966,6 +992,7 @@ impl From<ScalarBaseType> for ParamType {
             RegClass => ScalarType::RegClass,
             RegProc => ScalarType::RegProc,
             RegType => ScalarType::RegType,
+            Int2Vector => ScalarType::Int2Vector,
         };
         ParamType::Plain(s)
     }
@@ -1460,7 +1487,10 @@ fn coerce_args_to_types(
                 _ => arg.type_as_any(ecx)?,
             },
 
-            ParamType::RecordAny => unreachable!("records not yet supported for input"),
+            ParamType::RecordAny => {
+                let constrained = get_constrained_ty();
+                do_convert(arg, &constrained)?
+            }
         };
         exprs.push(expr);
     }
@@ -1710,38 +1740,23 @@ lazy_static! {
                 params!() => sql_impl_func("current_schemas(false)[1]") => String, 1402;
             },
             "current_schemas" => Scalar {
-                params!(Bool) => Operation::unary(|ecx, e| {
-                    let with_sys = HirScalarExpr::literal_1d_array(
-                        ecx.qcx.scx.catalog.search_path(true).iter().map(|s| Datum::String(s)).collect(),
-                        ScalarType::String)?;
-                    let without_sys = HirScalarExpr::literal_1d_array(
-                        ecx.qcx.scx.catalog.search_path(false).iter().map(|s| Datum::String(s)).collect(),
-                        ScalarType::String)?;
+                params!(Bool) => Operation::unary(|_ecx, e| {
                     Ok(HirScalarExpr::If {
                         cond: Box::new(e),
-                        then: Box::new(with_sys),
-                        els: Box::new(without_sys),
+                        then: Box::new(HirScalarExpr::CallNullary(NullaryFunc::CurrentSchemasWithSystem)),
+                        els: Box::new(HirScalarExpr::CallNullary(NullaryFunc::CurrentSchemasWithoutSystem)),
                     })
                     // TODO: this should be name[]
                 }) => ScalarType::Array(Box::new(ScalarType::String)), 1403;
             },
             "current_database" => Scalar {
-                params!() => Operation::nullary(|ecx| {
-                    let datum = Datum::String(ecx.qcx.scx.catalog.default_database());
-                    Ok(HirScalarExpr::literal(datum, ScalarType::String))
-                }), 861;
+                params!() => NullaryFunc::CurrentDatabase, 861;
             },
             "current_user" => Scalar {
-                params!() => Operation::nullary(|ecx| {
-                    let datum = Datum::String(ecx.qcx.scx.catalog.user());
-                    Ok(HirScalarExpr::literal(datum, ScalarType::String))
-                }), 745;
+                params!() => NullaryFunc::CurrentUser, 745;
             },
             "session_user" => Scalar {
-                params!() => Operation::nullary(|ecx| {
-                    let datum = Datum::String(ecx.qcx.scx.catalog.user());
-                    Ok(HirScalarExpr::literal(datum, ScalarType::String))
-                }), 746;
+                params!() => NullaryFunc::CurrentUser, 746;
             },
             "chr" => Scalar {
                 params!(Int32) => UnaryFunc::Chr(func::Chr), 1621;
@@ -1795,7 +1810,7 @@ lazy_static! {
                 params!(Oid, Int32) => sql_impl_func(
                     "CASE
                         WHEN $1 IS NULL THEN NULL
-                        ELSE coalesce((SELECT concat(coalesce(mz_internal.mz_type_name($1), name), mz_internal.mz_render_typemod($1, $2)) FROM mz_catalog.mz_types WHERE oid = $1), '???')
+                        ELSE coalesce((SELECT concat(coalesce(mz_internal.mz_type_name($1), name), mz_internal.mz_render_typmod($1, $2)) FROM mz_catalog.mz_types WHERE oid = $1), '???')
                     END"
                 ) => String, 1081;
             },
@@ -1837,6 +1852,15 @@ lazy_static! {
             },
             "jsonb_typeof" => Scalar {
                 params!(Jsonb) => UnaryFunc::JsonbTypeof, 3210;
+            },
+            "justify_days" => Scalar {
+                params!(Interval) => UnaryFunc::JustifyDays(func::JustifyDays), 1295;
+            },
+            "justify_hours" => Scalar {
+                params!(Interval) => UnaryFunc::JustifyHours(func::JustifyHours), 1175;
+            },
+            "justify_interval" => Scalar {
+                params!(Interval) => UnaryFunc::JustifyInterval(func::JustifyInterval), 2711;
             },
             "left" => Scalar {
                 params!(String, Int32) => BinaryFunc::Left, 3060;
@@ -1896,7 +1920,7 @@ lazy_static! {
                 params!(Int64, Int64) => Operation::nullary(|_ecx| catalog_name_only!("mod")) => Int64, 947;
             },
             "now" => Scalar {
-                params!() => Operation::nullary(|ecx| plan_current_timestamp(ecx, "now")), 1299;
+                params!() => NullaryFunc::CurrentTimestamp, 1299;
             },
             "octet_length" => Scalar {
                 params!(Bytes) => UnaryFunc::ByteLengthBytes, 720;
@@ -1934,12 +1958,7 @@ lazy_static! {
                 params!(Int64) => sql_impl_func("CASE WHEN $1 = 6 THEN 'UTF8' ELSE NULL END") => String, 1597;
             },
             "pg_backend_pid" => Scalar {
-                params!() => Operation::nullary(|_ecx| {
-                    Ok(HirScalarExpr::literal(
-                        Datum::from(-1),
-                        ScalarType::Int32,
-                    ))
-                }), 2026;
+                params!() => NullaryFunc::PgBackendPid, 2026;
             },
             // pg_get_constraintdef gives more info about a constraint with in the `pg_constraint`
             // view. It currently returns no information as the `pg_constraint` view is empty in
@@ -1963,7 +1982,7 @@ lazy_static! {
                 params!(Oid) => sql_impl_func("'unknown (OID=' || $1 || ')'") => String, 1642;
             },
             "pg_postmaster_start_time" => Scalar {
-                params!() => Operation::nullary(pg_postmaster_start_time), 2560;
+                params!() => NullaryFunc::PgPostmasterStartTime, 2560;
             },
             "pg_table_is_visible" => Scalar {
                 params!(Oid) => sql_impl_func(
@@ -2177,14 +2196,7 @@ lazy_static! {
                 params!(Int64) => Operation::nullary(|_ecx| catalog_name_only!("var_samp")) => Numeric, 2641;
             },
             "version" => Scalar {
-                params!() => Operation::nullary(|ecx| {
-                    let build_info = ecx.catalog().config().build_info;
-                    let version = format!(
-                        "PostgreSQL 9.6 on {} (materialized {})",
-                        build_info.target_triple, build_info.version,
-                    );
-                    Ok(HirScalarExpr::literal(Datum::String(&version), ScalarType::String))
-                }), 89;
+                params!() => NullaryFunc::Version, 89;
             },
 
             // Aggregates.
@@ -2539,7 +2551,7 @@ lazy_static! {
                 params!(Any) => Operation::unary(|_ecx, _e| bail_unsupported!("concat_agg")) => String, oid::FUNC_CONCAT_AGG_OID;
             },
             "current_timestamp" => Scalar {
-                params!() => Operation::nullary(|ecx| plan_current_timestamp(ecx, "current_timestamp")), oid::FUNC_CURRENT_TIMESTAMP_OID;
+                params!() => NullaryFunc::CurrentTimestamp, oid::FUNC_CURRENT_TIMESTAMP_OID;
             },
             "list_agg" => Aggregate {
                 params!(Any) => Operation::unary_ordered(|ecx, e, order_by| {
@@ -2588,19 +2600,16 @@ lazy_static! {
                 }) => ListAny, oid::FUNC_LIST_REMOVE_OID;
             },
             "mz_cluster_id" => Scalar {
-                params!() => Operation::nullary(mz_cluster_id), oid::FUNC_MZ_CLUSTER_ID_OID;
+                params!() => NullaryFunc::MzClusterId, oid::FUNC_MZ_CLUSTER_ID_OID;
             },
             "mz_logical_timestamp" => Scalar {
                 params!() => NullaryFunc::MzLogicalTimestamp, oid::FUNC_MZ_LOGICAL_TIMESTAMP_OID;
             },
             "mz_uptime" => Scalar {
-                params!() => Operation::nullary(mz_uptime), oid::FUNC_MZ_UPTIME_OID;
+                params!() => NullaryFunc::MzUptime, oid::FUNC_MZ_UPTIME_OID;
             },
             "mz_version" => Scalar {
-                params!() => Operation::nullary(|ecx| {
-                    let version = ecx.catalog().config().build_info.human_version();
-                    Ok(HirScalarExpr::literal(Datum::String(&version), ScalarType::String))
-                }), oid::FUNC_MZ_VERSION_OID;
+                params!() => NullaryFunc::MzVersion, oid::FUNC_MZ_VERSION_OID;
             },
             "regexp_extract" => Table {
                 params!(String, String) => Operation::binary(move |_ecx, regex, haystack| {
@@ -2708,14 +2717,14 @@ lazy_static! {
                 params!(String) => sql_impl_func("EXISTS (SELECT 1 FROM mz_indexes WHERE on_id = $1 AND enabled)") => Bool,
                     oid::FUNC_MZ_IS_MATERIALIZED_OID;
             },
-            "mz_render_typemod" => Scalar {
-                params!(Oid, Int32) => BinaryFunc::MzRenderTypemod, oid::FUNC_MZ_RENDER_TYPEMOD_OID;
+            "mz_render_typmod" => Scalar {
+                params!(Oid, Int32) => BinaryFunc::MzRenderTypmod, oid::FUNC_MZ_RENDER_TYPMOD_OID;
             },
             // This ought to be exposed in `mz_catalog`, but its name is rather
             // confusing. It does not identify the SQL session, but the
             // invocation of this `materialized` process.
             "mz_session_id" => Scalar {
-                params!() => Operation::nullary(mz_session_id), oid::FUNC_MZ_SESSION_ID_OID;
+                params!() => NullaryFunc::MzSessionId, oid::FUNC_MZ_SESSION_ID_OID;
             },
             "mz_sleep" => Scalar {
                 params!(Float64) => UnaryFunc::Sleep(func::Sleep), oid::FUNC_MZ_SLEEP_OID;
@@ -2727,55 +2736,11 @@ lazy_static! {
     };
 }
 
-fn plan_current_timestamp(ecx: &ExprContext, name: &str) -> Result<HirScalarExpr, PlanError> {
-    match ecx.qcx.lifetime {
-        QueryLifetime::OneShot(pcx) => Ok(HirScalarExpr::literal(
-            Datum::from(pcx.wall_time),
-            ScalarType::TimestampTz,
-        )),
-        QueryLifetime::Static => sql_bail!("{} cannot be used in static queries; see: https://materialize.com/docs/sql/functions/now_and_mz_logical_timestamp/", name),
-    }
-}
-
 fn digest(algorithm: &'static str) -> Operation<HirScalarExpr> {
     Operation::unary(move |_ecx, input| {
         let algorithm = HirScalarExpr::literal(Datum::String(algorithm), ScalarType::String);
         Ok(input.call_binary(algorithm, BinaryFunc::DigestBytes))
     })
-}
-
-fn mz_cluster_id(ecx: &ExprContext) -> Result<HirScalarExpr, PlanError> {
-    Ok(HirScalarExpr::literal(
-        Datum::from(ecx.catalog().config().cluster_id),
-        ScalarType::Uuid,
-    ))
-}
-
-fn mz_session_id(ecx: &ExprContext) -> Result<HirScalarExpr, PlanError> {
-    Ok(HirScalarExpr::literal(
-        Datum::from(ecx.catalog().config().session_id),
-        ScalarType::Uuid,
-    ))
-}
-
-fn mz_uptime(ecx: &ExprContext) -> Result<HirScalarExpr, PlanError> {
-    let uptime = ecx.catalog().config().start_instant.elapsed();
-    let uptime = chrono::Duration::from_std(uptime)
-        .map_err(|e| PlanError::Unstructured(format!("converting uptime to duration: {}", e)))?;
-    match ecx.qcx.lifetime {
-        QueryLifetime::OneShot(_) => Ok(HirScalarExpr::literal(
-            Datum::from(uptime),
-            ScalarType::Interval,
-        )),
-        QueryLifetime::Static => sql_bail!("mz_uptime cannot be used in static queries"),
-    }
-}
-
-fn pg_postmaster_start_time(ecx: &ExprContext) -> Result<HirScalarExpr, PlanError> {
-    Ok(HirScalarExpr::literal(
-        Datum::from(ecx.catalog().config().start_time),
-        ScalarType::TimestampTz,
-    ))
 }
 
 fn array_to_string(
@@ -3162,6 +3127,7 @@ lazy_static! {
                 params!(Char, Char) => BinaryFunc::Lt, 1058;
                 params!(Jsonb, Jsonb) => BinaryFunc::Lt, 3242;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::Lt => Bool, 1072;
+                params!(RecordAny, RecordAny) => BinaryFunc::Lt => Bool, 2990;
             },
             "<=" => Scalar {
                 params!(Numeric, Numeric) => BinaryFunc::Lte, 1755;
@@ -3183,6 +3149,7 @@ lazy_static! {
                 params!(Char, Char) => BinaryFunc::Lte, 1059;
                 params!(Jsonb, Jsonb) => BinaryFunc::Lte, 3244;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::Lte => Bool, 1074;
+                params!(RecordAny, RecordAny) => BinaryFunc::Lte => Bool, 2992;
             },
             ">" => Scalar {
                 params!(Numeric, Numeric) => BinaryFunc::Gt, 1756;
@@ -3204,6 +3171,7 @@ lazy_static! {
                 params!(Char, Char) => BinaryFunc::Gt, 1060;
                 params!(Jsonb, Jsonb) => BinaryFunc::Gt, 3243;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::Gt => Bool, 1073;
+                params!(RecordAny, RecordAny) => BinaryFunc::Gt => Bool, 2991;
             },
             ">=" => Scalar {
                 params!(Numeric, Numeric) => BinaryFunc::Gte, 1757;
@@ -3225,6 +3193,7 @@ lazy_static! {
                 params!(Char, Char) => BinaryFunc::Gte, 1061;
                 params!(Jsonb, Jsonb) => BinaryFunc::Gte, 3245;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::Gte => Bool, 1075;
+                params!(RecordAny, RecordAny) => BinaryFunc::Gte => Bool, 2993;
             },
             // Warning! If you are writing functions here that do not simply use
             // `BinaryFunc::Eq`, you will break row equality (used e.g. DISTINCT
@@ -3250,6 +3219,7 @@ lazy_static! {
                 params!(Jsonb, Jsonb) => BinaryFunc::Eq, 3240;
                 params!(ListAny, ListAny) => BinaryFunc::Eq => Bool, oid::FUNC_LIST_EQ_OID;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::Eq => Bool, 1070;
+                params!(RecordAny, RecordAny) => BinaryFunc::Eq => Bool, 2988;
             },
             "<>" => Scalar {
                 params!(Numeric, Numeric) => BinaryFunc::NotEq, 1753;
@@ -3271,6 +3241,7 @@ lazy_static! {
                 params!(Char, Char) => BinaryFunc::NotEq, 1057;
                 params!(Jsonb, Jsonb) => BinaryFunc::NotEq, 3241;
                 params!(ArrayAny, ArrayAny) => BinaryFunc::NotEq => Bool, 1071;
+                params!(RecordAny, RecordAny) => BinaryFunc::NotEq => Bool, 2989;
             }
         }
     };

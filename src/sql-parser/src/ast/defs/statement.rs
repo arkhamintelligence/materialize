@@ -74,6 +74,7 @@ pub enum Statement<T: AstInfo> {
     Prepare(PrepareStatement<T>),
     Execute(ExecuteStatement<T>),
     Deallocate(DeallocateStatement),
+    Raise(RaiseStatement),
 }
 
 impl<T: AstInfo> AstDisplay for Statement<T> {
@@ -122,6 +123,7 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::Prepare(stmt) => f.write_node(stmt),
             Statement::Execute(stmt) => f.write_node(stmt),
             Statement::Deallocate(stmt) => f.write_node(stmt),
+            Statement::Raise(stmt) => f.write_node(stmt),
         }
     }
 }
@@ -769,10 +771,7 @@ pub struct CreateTypeStatement<T: AstInfo> {
     /// Name of the created type.
     pub name: UnresolvedObjectName,
     /// The new type's "base type".
-    pub as_type: CreateTypeAs,
-    /// Provides the name and type for the key
-    /// and value.
-    pub with_options: Vec<SqlOption<T>>,
+    pub as_type: CreateTypeAs<T>,
 }
 
 impl<T: AstInfo> AstDisplay for CreateTypeStatement<T> {
@@ -780,32 +779,45 @@ impl<T: AstInfo> AstDisplay for CreateTypeStatement<T> {
         f.write_str("CREATE TYPE ");
         f.write_node(&self.name);
         f.write_str(" AS ");
-        f.write_str(&self.as_type);
-        f.write_str("( ");
-        if !self.with_options.is_empty() {
-            f.write_node(&display::comma_separated(&self.with_options));
-        }
-        f.write_str(" )");
+        match &self.as_type {
+            CreateTypeAs::List { with_options } | CreateTypeAs::Map { with_options } => {
+                f.write_str(&self.as_type);
+                f.write_str("( ");
+                if !with_options.is_empty() {
+                    f.write_node(&display::comma_separated(&with_options));
+                }
+                f.write_str(" )");
+            }
+            CreateTypeAs::Record { column_defs } => {
+                f.write_str("( ");
+                if !column_defs.is_empty() {
+                    f.write_node(&display::comma_separated(&column_defs));
+                }
+                f.write_str(" )");
+            }
+        };
     }
 }
 impl_display_t!(CreateTypeStatement);
 
 /// `CREATE TYPE .. AS <TYPE>`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CreateTypeAs {
-    List,
-    Map,
+pub enum CreateTypeAs<T: AstInfo> {
+    List { with_options: Vec<SqlOption<T>> },
+    Map { with_options: Vec<SqlOption<T>> },
+    Record { column_defs: Vec<ColumnDef<T>> },
 }
 
-impl AstDisplay for CreateTypeAs {
+impl<T: AstInfo> AstDisplay for CreateTypeAs<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            CreateTypeAs::List => f.write_str("LIST "),
-            CreateTypeAs::Map => f.write_str("MAP "),
+            CreateTypeAs::List { .. } => f.write_str("LIST "),
+            CreateTypeAs::Map { .. } => f.write_str("MAP "),
+            CreateTypeAs::Record { .. } => f.write_str("RECORD "),
         }
     }
 }
-impl_display!(CreateTypeAs);
+impl_display_t!(CreateTypeAs);
 
 /// `ALTER <OBJECT> ... RENAME TO`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1760,3 +1772,39 @@ impl AstDisplay for DeallocateStatement {
     }
 }
 impl_display!(DeallocateStatement);
+
+/// `RAISE ...`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RaiseStatement {
+    pub severity: NoticeSeverity,
+}
+
+impl AstDisplay for RaiseStatement {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("RAISE ");
+        f.write_node(&self.severity);
+    }
+}
+impl_display!(RaiseStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NoticeSeverity {
+    Debug,
+    Info,
+    Log,
+    Notice,
+    Warning,
+}
+
+impl AstDisplay for NoticeSeverity {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            NoticeSeverity::Debug => "DEBUG",
+            NoticeSeverity::Info => "INFO",
+            NoticeSeverity::Log => "LOG",
+            NoticeSeverity::Notice => "NOTICE",
+            NoticeSeverity::Warning => "WARNING",
+        })
+    }
+}
+impl_display!(NoticeSeverity);

@@ -34,6 +34,7 @@ use mz_lowertest::MzReflect;
 use mz_ore::cast;
 use mz_ore::collections::CollectionExt;
 use mz_ore::fmt::FormatBuffer;
+use mz_ore::option::OptionExt;
 use mz_ore::str::StrExt;
 use mz_pgrepr::Type;
 use mz_repr::adt::array::ArrayDimension;
@@ -42,7 +43,9 @@ use mz_repr::adt::interval::Interval;
 use mz_repr::adt::jsonb::JsonbRef;
 use mz_repr::adt::numeric::{self, DecimalLike, Numeric, NumericMaxScale};
 use mz_repr::adt::regex::Regex;
-use mz_repr::{strconv, ColumnName, ColumnType, Datum, DatumType, Row, RowArena, ScalarType};
+use mz_repr::{
+    strconv, ColumnName, ColumnType, Datum, DatumType, Row, RowArena, RowPacker, ScalarType,
+};
 
 use crate::scalar::func::format::DateTimeFormat;
 use crate::{like_pattern, EvalError, MirScalarExpr};
@@ -57,16 +60,45 @@ pub use impls::*;
 
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
 pub enum NullaryFunc {
+    CurrentDatabase,
+    CurrentSchemasWithSystem,
+    CurrentSchemasWithoutSystem,
+    CurrentTimestamp,
+    CurrentUser,
+    MzClusterId,
     MzLogicalTimestamp,
+    MzSessionId,
+    MzUptime,
+    MzVersion,
+    PgBackendPid,
+    PgPostmasterStartTime,
+    Version,
 }
 
 impl NullaryFunc {
     pub fn output_type(&self) -> ColumnType {
         match self {
+            NullaryFunc::CurrentDatabase => ScalarType::String.nullable(false),
+            // TODO: The `CurrentSchemas` functions should should return name[].
+            NullaryFunc::CurrentSchemasWithSystem => {
+                ScalarType::Array(Box::new(ScalarType::String)).nullable(false)
+            }
+            NullaryFunc::CurrentSchemasWithoutSystem => {
+                ScalarType::Array(Box::new(ScalarType::String)).nullable(false)
+            }
+            NullaryFunc::CurrentTimestamp => ScalarType::TimestampTz.nullable(false),
+            NullaryFunc::CurrentUser => ScalarType::String.nullable(false),
+            NullaryFunc::MzClusterId => ScalarType::Uuid.nullable(false),
             NullaryFunc::MzLogicalTimestamp => ScalarType::Numeric {
                 max_scale: Some(NumericMaxScale::ZERO),
             }
             .nullable(false),
+            NullaryFunc::MzSessionId => ScalarType::Uuid.nullable(false),
+            NullaryFunc::MzUptime => ScalarType::Interval.nullable(true),
+            NullaryFunc::MzVersion => ScalarType::String.nullable(false),
+            NullaryFunc::PgBackendPid => ScalarType::Int32.nullable(false),
+            NullaryFunc::PgPostmasterStartTime => ScalarType::TimestampTz.nullable(false),
+            NullaryFunc::Version => ScalarType::String.nullable(false),
         }
     }
 }
@@ -74,7 +106,19 @@ impl NullaryFunc {
 impl fmt::Display for NullaryFunc {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            NullaryFunc::CurrentDatabase => f.write_str("current_database"),
+            NullaryFunc::CurrentSchemasWithSystem => f.write_str("current_schemas(true)"),
+            NullaryFunc::CurrentSchemasWithoutSystem => f.write_str("current_schemas(false)"),
+            NullaryFunc::CurrentTimestamp => f.write_str("current_timestamp"),
+            NullaryFunc::CurrentUser => f.write_str("current_user"),
+            NullaryFunc::MzClusterId => f.write_str("mz_cluster_id"),
             NullaryFunc::MzLogicalTimestamp => f.write_str("mz_logical_timestamp"),
+            NullaryFunc::MzSessionId => f.write_str("mz_session_id"),
+            NullaryFunc::MzUptime => f.write_str("mz_uptime"),
+            NullaryFunc::MzVersion => f.write_str("mz_version"),
+            NullaryFunc::PgBackendPid => f.write_str("pg_backend_pid"),
+            NullaryFunc::PgPostmasterStartTime => f.write_str("pg_postmaster_start_time"),
+            NullaryFunc::Version => f.write_str("version"),
         }
     }
 }
@@ -242,6 +286,19 @@ fn jsonb_type(d: Datum<'_>) -> &'static str {
         Datum::Map(_) => "object",
         _ => unreachable!("jsonb_type called on invalid datum {:?}", d),
     }
+}
+/// Casts between two record types by casting each element of `a` ("record1") using
+/// `cast_expr` and collecting the results into a new record ("record2").
+fn cast_record1_to_record2<'a>(
+    a: Datum,
+    cast_exprs: &'a Vec<MirScalarExpr>,
+    temp_storage: &'a RowArena,
+) -> Result<Datum<'a>, EvalError> {
+    let mut cast_datums = Vec::new();
+    for (el, cast_expr) in a.unwrap_list().iter().zip_eq(cast_exprs) {
+        cast_datums.push(cast_expr.eval(&[el], temp_storage)?);
+    }
+    Ok(temp_storage.make_datum(|packer| packer.push_list(cast_datums)))
 }
 
 /// Casts between two list types by casting each element of `a` ("list1") using
@@ -1765,7 +1822,7 @@ where
 {
     let interval = interval.unwrap_interval();
     match units {
-        DateTimeUnits::Epoch => Ok(interval.as_seconds::<D>().into()),
+        DateTimeUnits::Epoch => Ok(interval.as_epoch_seconds::<D>().into()),
         DateTimeUnits::Millennium => Ok(D::from(interval.millennia()).into()),
         DateTimeUnits::Century => Ok(D::from(interval.centuries()).into()),
         DateTimeUnits::Decade => Ok(D::from(interval.decades()).into()),
@@ -1932,18 +1989,22 @@ pub fn date_bin<'a, T>(stride: Interval, source: T, origin: T) -> Result<Datum<'
 where
     T: TimestampLike,
 {
-    let stride_ns = if stride.months != 0 {
-        Err(EvalError::DateBinOutOfRange(
+    if stride.months != 0 {
+        return Err(EvalError::DateBinOutOfRange(
             "timestamps cannot be binned into intervals containing months or years".to_string(),
-        ))
-    } else if stride.duration <= 0 {
-        Err(EvalError::DateBinOutOfRange(
+        ));
+    }
+
+    let stride_ns = match stride.duration_as_chrono().num_nanoseconds() {
+        Some(ns) if ns <= 0 => Err(EvalError::DateBinOutOfRange(
             "stride must be greater than zero".to_string(),
-        ))
-    } else {
-        i64::try_from(stride.duration).map_err(|_| {
-            EvalError::DateBinOutOfRange("stride cannot exceed 2^63 nanoseconds".to_string())
-        })
+        )),
+        Some(ns) => Ok(ns),
+        None => Err(EvalError::DateBinOutOfRange(format!(
+            "stride cannot exceed {}/{} nanoseconds",
+            i64::MAX,
+            i64::MIN,
+        ))),
     }?;
 
     // Make sure the returned timestamp is at the start of the bin, even if the
@@ -2120,7 +2181,7 @@ fn jsonb_typeof<'a>(a: Datum<'a>) -> Datum<'a> {
 }
 
 fn jsonb_strip_nulls<'a>(a: Datum<'a>, temp_storage: &'a RowArena) -> Datum<'a> {
-    fn strip_nulls(a: Datum, row: &mut Row) {
+    fn strip_nulls(a: Datum, row: &mut RowPacker) {
         match a {
             Datum::Map(dict) => row.push_dict_with(|row| {
                 for (k, v) in dict.iter() {
@@ -2284,7 +2345,7 @@ pub enum BinaryFunc {
     ListRemove,
     DigestString,
     DigestBytes,
-    MzRenderTypemod,
+    MzRenderTypmod,
     Encode,
     Decode,
     LogNumeric,
@@ -2528,7 +2589,7 @@ impl BinaryFunc {
             BinaryFunc::ListRemove => Ok(eager!(list_remove, temp_storage)),
             BinaryFunc::DigestString => eager!(digest_string, temp_storage),
             BinaryFunc::DigestBytes => eager!(digest_bytes, temp_storage),
-            BinaryFunc::MzRenderTypemod => Ok(eager!(mz_render_typemod, temp_storage)),
+            BinaryFunc::MzRenderTypmod => eager!(mz_render_typmod, temp_storage),
             BinaryFunc::LogNumeric => eager!(log_base_numeric),
             BinaryFunc::Power => eager!(power),
             BinaryFunc::PowerNumeric => eager!(power_numeric),
@@ -2543,21 +2604,6 @@ impl BinaryFunc {
     pub fn output_type(&self, input1_type: ColumnType, input2_type: ColumnType) -> ColumnType {
         use BinaryFunc::*;
         let in_nullable = input1_type.nullable || input2_type.nullable;
-        let is_div_mod = matches!(
-            self,
-            DivInt16
-                | ModInt16
-                | DivInt32
-                | ModInt32
-                | DivInt64
-                | ModInt64
-                | DivFloat32
-                | ModFloat32
-                | DivFloat64
-                | ModFloat64
-                | DivNumeric
-                | ModNumeric
-        );
         match self {
             And | Or | Eq | NotEq | Lt | Lte | Gt | Gte | ArrayContains => {
                 ScalarType::Bool.nullable(in_nullable)
@@ -2573,7 +2619,7 @@ impl BinaryFunc {
 
             AddInt16 | SubInt16 | MulInt16 | DivInt16 | ModInt16 | BitAndInt16 | BitOrInt16
             | BitXorInt16 | BitShiftLeftInt16 | BitShiftRightInt16 => {
-                ScalarType::Int16.nullable(in_nullable || is_div_mod)
+                ScalarType::Int16.nullable(in_nullable)
             }
 
             AddInt32
@@ -2587,19 +2633,19 @@ impl BinaryFunc {
             | BitShiftLeftInt32
             | BitShiftRightInt32
             | EncodedBytesCharLength
-            | SubDate => ScalarType::Int32.nullable(in_nullable || is_div_mod),
+            | SubDate => ScalarType::Int32.nullable(in_nullable),
 
             AddInt64 | SubInt64 | MulInt64 | DivInt64 | ModInt64 | BitAndInt64 | BitOrInt64
             | BitXorInt64 | BitShiftLeftInt64 | BitShiftRightInt64 => {
-                ScalarType::Int64.nullable(in_nullable || is_div_mod)
+                ScalarType::Int64.nullable(in_nullable)
             }
 
             AddFloat32 | SubFloat32 | MulFloat32 | DivFloat32 | ModFloat32 => {
-                ScalarType::Float32.nullable(in_nullable || is_div_mod)
+                ScalarType::Float32.nullable(in_nullable)
             }
 
             AddFloat64 | SubFloat64 | MulFloat64 | DivFloat64 | ModFloat64 => {
-                ScalarType::Float64.nullable(in_nullable || is_div_mod)
+                ScalarType::Float64.nullable(in_nullable)
             }
 
             AddInterval | SubInterval | SubTimestamp | SubTimestampTz | MulInterval
@@ -2637,7 +2683,7 @@ impl BinaryFunc {
 
             SubTime => ScalarType::Interval.nullable(true),
 
-            MzRenderTypemod | TextConcat => ScalarType::String.nullable(in_nullable),
+            MzRenderTypmod | TextConcat => ScalarType::String.nullable(in_nullable),
 
             JsonbGetInt64 { stringify: true }
             | JsonbGetString { stringify: true }
@@ -2669,16 +2715,10 @@ impl BinaryFunc {
             }
 
             ArrayArrayConcat | ArrayRemove | ListListConcat | ListElementConcat | ListRemove => {
-                input1_type
-                    .scalar_type
-                    .default_embedded_value()
-                    .nullable(true)
+                input1_type.scalar_type.without_modifiers().nullable(true)
             }
 
-            ElementListConcat => input2_type
-                .scalar_type
-                .default_embedded_value()
-                .nullable(true),
+            ElementListConcat => input2_type.scalar_type.without_modifiers().nullable(true),
 
             DigestString | DigestBytes => ScalarType::Bytes.nullable(true),
             Position => ScalarType::Int32.nullable(in_nullable),
@@ -2923,7 +2963,7 @@ impl BinaryFunc {
             | ListLengthMax { .. }
             | DigestString
             | DigestBytes
-            | MzRenderTypemod
+            | MzRenderTypmod
             | Encode
             | Decode
             | LogNumeric
@@ -3094,7 +3134,7 @@ impl fmt::Display for BinaryFunc {
             BinaryFunc::ElementListConcat => f.write_str("||"),
             BinaryFunc::ListRemove => f.write_str("list_remove"),
             BinaryFunc::DigestString | BinaryFunc::DigestBytes => f.write_str("digest"),
-            BinaryFunc::MzRenderTypemod => f.write_str("mz_render_typemod"),
+            BinaryFunc::MzRenderTypmod => f.write_str("mz_render_typmod"),
             BinaryFunc::Encode => f.write_str("encode"),
             BinaryFunc::Decode => f.write_str("decode"),
             BinaryFunc::LogNumeric => f.write_str("log"),
@@ -3223,20 +3263,18 @@ pub enum UnaryFunc {
     CastInt16ToFloat64(CastInt16ToFloat64),
     CastInt16ToInt32(CastInt16ToInt32),
     CastInt16ToInt64(CastInt16ToInt64),
-    CastInt16ToOid(CastInt16ToOid),
     CastInt16ToString(CastInt16ToString),
+    CastInt2VectorToArray(CastInt2VectorToArray),
     CastInt32ToBool(CastInt32ToBool),
     CastInt32ToFloat32(CastInt32ToFloat32),
     CastInt32ToFloat64(CastInt32ToFloat64),
     CastInt32ToOid(CastInt32ToOid),
-    CastInt32ToRegClass(CastInt32ToRegClass),
-    CastInt32ToRegProc(CastInt32ToRegProc),
-    CastInt32ToRegType(CastInt32ToRegType),
     CastInt32ToInt16(CastInt32ToInt16),
     CastInt32ToInt64(CastInt32ToInt64),
     CastInt32ToString(CastInt32ToString),
     CastOidToInt32(CastOidToInt32),
     CastOidToInt64(CastOidToInt64),
+    CastOidToString(CastOidToString),
     CastOidToRegClass(CastOidToRegClass),
     CastRegClassToOid(CastRegClassToOid),
     CastOidToRegProc(CastOidToRegProc),
@@ -3276,6 +3314,8 @@ pub enum UnaryFunc {
     CastStringToInt16(CastStringToInt16),
     CastStringToInt32(CastStringToInt32),
     CastStringToInt64(CastStringToInt64),
+    CastStringToInt2Vector(CastStringToInt2Vector),
+    CastStringToOid(CastStringToOid),
     CastStringToFloat32(CastStringToFloat32),
     CastStringToFloat64(CastStringToFloat64),
     CastStringToDate(CastStringToDate),
@@ -3323,6 +3363,10 @@ pub enum UnaryFunc {
     CastRecordToString {
         ty: ScalarType,
     },
+    CastRecord1ToRecord2 {
+        return_ty: ScalarType,
+        cast_exprs: Vec<MirScalarExpr>,
+    },
     CastArrayToString {
         ty: ScalarType,
     },
@@ -3342,6 +3386,7 @@ pub enum UnaryFunc {
     CastInPlace {
         return_ty: ScalarType,
     },
+    CastInt2VectorToString,
     CeilFloat32(CeilFloat32),
     CeilFloat64(CeilFloat64),
     CeilNumeric(CeilNumeric),
@@ -3376,6 +3421,9 @@ pub enum UnaryFunc {
         wall_time: NaiveDateTime,
     },
     ToTimestamp(ToTimestamp),
+    JustifyDays(JustifyDays),
+    JustifyHours(JustifyHours),
+    JustifyInterval(JustifyInterval),
     JsonbArrayLength,
     JsonbTypeof,
     JsonbStripNulls,
@@ -3455,9 +3503,9 @@ derive_unary!(
     CastInt16ToFloat64,
     CastInt16ToInt32,
     CastInt16ToInt64,
-    CastInt16ToOid,
     CastInt16ToString,
     CastInt16ToNumeric,
+    CastInt2VectorToArray,
     CastInt32ToBool,
     CastInt32ToFloat32,
     CastInt32ToFloat64,
@@ -3465,9 +3513,6 @@ derive_unary!(
     CastInt32ToInt64,
     CastInt32ToString,
     CastInt32ToOid,
-    CastInt32ToRegClass,
-    CastInt32ToRegProc,
-    CastInt32ToRegType,
     CastInt64ToInt16,
     CastInt64ToInt32,
     CastInt64ToBool,
@@ -3481,6 +3526,7 @@ derive_unary!(
     CastInt32ToNumeric,
     CastOidToInt32,
     CastOidToInt64,
+    CastOidToString,
     CastOidToRegClass,
     CastRegClassToOid,
     CastOidToRegProc,
@@ -3508,6 +3554,9 @@ derive_unary!(
     CastBoolToStringNonstandard,
     CastBoolToInt32,
     ToTimestamp,
+    JustifyDays,
+    JustifyHours,
+    JustifyInterval,
     CastFloat64ToString,
     CastNumericToFloat32,
     CastNumericToFloat64,
@@ -3520,9 +3569,11 @@ derive_unary!(
     CastStringToInt16,
     CastStringToInt32,
     CastStringToInt64,
+    CastStringToInt2Vector,
     CastStringToFloat32,
     CastStringToFloat64,
     CastStringToNumeric,
+    CastStringToOid,
     CastStringToDate,
     CastStringToTime,
     CastStringToTimestamp,
@@ -3654,8 +3705,8 @@ impl UnaryFunc {
             | CastInt16ToFloat64(_)
             | CastInt16ToInt32(_)
             | CastInt16ToInt64(_)
-            | CastInt16ToOid(_)
             | CastInt16ToString(_)
+            | CastInt2VectorToArray(_)
             | CastInt32ToBool(_)
             | CastInt32ToFloat32(_)
             | CastInt32ToFloat64(_)
@@ -3663,11 +3714,9 @@ impl UnaryFunc {
             | CastInt32ToInt64(_)
             | CastInt32ToString(_)
             | CastInt32ToOid(_)
-            | CastInt32ToRegClass(_)
-            | CastInt32ToRegProc(_)
-            | CastInt32ToRegType(_)
             | CastOidToInt32(_)
             | CastOidToInt64(_)
+            | CastOidToString(_)
             | CastOidToRegClass(_)
             | CastRegClassToOid(_)
             | CastOidToRegProc(_)
@@ -3708,8 +3757,10 @@ impl UnaryFunc {
             | CastStringToInt16(_)
             | CastStringToInt32(_)
             | CastStringToInt64(_)
+            | CastStringToInt2Vector(_)
             | CastStringToFloat32(_)
             | CastStringToFloat64(_)
+            | CastStringToOid(_)
             | CastStringToNumeric(_)
             | CastStringToDate(_)
             | CastStringToTime(_)
@@ -3731,6 +3782,9 @@ impl UnaryFunc {
             | CastIntervalToString(_)
             | CastIntervalToTime(_)
             | NegInterval(_)
+            | JustifyDays(_)
+            | JustifyHours(_)
+            | JustifyInterval(_)
             | CastUuidToString(_)
             | CastArrayToListOneDim(_)
             | CastTimestampToString(_)
@@ -3760,7 +3814,15 @@ impl UnaryFunc {
             | CastArrayToString { ty }
             | CastListToString { ty }
             | CastMapToString { ty } => Ok(cast_collection_to_string(a, ty, temp_storage)),
+            CastInt2VectorToString => Ok(cast_collection_to_string(
+                a,
+                &ScalarType::Int2Vector,
+                temp_storage,
+            )),
             CastList1ToList2 { cast_expr, .. } => cast_list1_to_list2(a, &*cast_expr, temp_storage),
+            CastRecord1ToRecord2 { cast_exprs, .. } => {
+                cast_record1_to_record2(a, cast_exprs, temp_storage)
+            }
             CastInPlace { .. } => Ok(a),
             Ascii => Ok(ascii(a)),
             BitLengthString => bit_length(a.unwrap_str()),
@@ -3881,8 +3943,8 @@ impl UnaryFunc {
             | CastInt16ToFloat64(_)
             | CastInt16ToInt32(_)
             | CastInt16ToInt64(_)
-            | CastInt16ToOid(_)
             | CastInt16ToString(_)
+            | CastInt2VectorToArray(_)
             | CastInt32ToBool(_)
             | CastInt32ToFloat32(_)
             | CastInt32ToFloat64(_)
@@ -3890,11 +3952,9 @@ impl UnaryFunc {
             | CastInt32ToInt64(_)
             | CastInt32ToString(_)
             | CastInt32ToOid(_)
-            | CastInt32ToRegClass(_)
-            | CastInt32ToRegProc(_)
-            | CastInt32ToRegType(_)
             | CastOidToInt32(_)
             | CastOidToInt64(_)
+            | CastOidToString(_)
             | CastOidToRegClass(_)
             | CastRegClassToOid(_)
             | CastOidToRegProc(_)
@@ -3934,9 +3994,11 @@ impl UnaryFunc {
             | CastStringToBytes(_)
             | CastStringToInt16(_)
             | CastStringToInt32(_)
+            | CastStringToInt2Vector(_)
             | CastStringToInt64(_)
             | CastStringToFloat32(_)
             | CastStringToFloat64(_)
+            | CastStringToOid(_)
             | CastStringToNumeric(_)
             | CastStringToDate(_)
             | CastStringToTime(_)
@@ -3958,6 +4020,9 @@ impl UnaryFunc {
             | CastIntervalToString(_)
             | CastIntervalToTime(_)
             | NegInterval(_)
+            | JustifyDays(_)
+            | JustifyHours(_)
+            | JustifyInterval(_)
             | CastUuidToString(_)
             | CastArrayToListOneDim(_)
             | CastTimestampToString(_)
@@ -3985,6 +4050,7 @@ impl UnaryFunc {
             | CastArrayToString { .. }
             | CastListToString { .. }
             | CastMapToString { .. }
+            | CastInt2VectorToString
             | TrimWhitespace
             | TrimLeadingWhitespace
             | TrimTrailingWhitespace
@@ -4014,9 +4080,11 @@ impl UnaryFunc {
 
             CastInPlace { return_ty } => (return_ty.clone()).nullable(nullable),
 
-            CastList1ToList2 { return_ty, .. } => {
-                return_ty.default_embedded_value().nullable(false)
+            CastRecord1ToRecord2 { return_ty, .. } => {
+                return_ty.without_modifiers().nullable(nullable)
             }
+
+            CastList1ToList2 { return_ty, .. } => return_ty.without_modifiers().nullable(false),
 
             ExtractInterval(_)
             | ExtractTime(_)
@@ -4135,8 +4203,8 @@ impl UnaryFunc {
             | CastInt16ToFloat64(_)
             | CastInt16ToInt32(_)
             | CastInt16ToInt64(_)
-            | CastInt16ToOid(_)
             | CastInt16ToString(_)
+            | CastInt2VectorToArray(_)
             | CastInt32ToBool(_)
             | CastInt32ToFloat32(_)
             | CastInt32ToFloat64(_)
@@ -4144,11 +4212,9 @@ impl UnaryFunc {
             | CastInt32ToInt64(_)
             | CastInt32ToString(_)
             | CastInt32ToOid(_)
-            | CastInt32ToRegClass(_)
-            | CastInt32ToRegProc(_)
-            | CastInt32ToRegType(_)
             | CastOidToInt32(_)
             | CastOidToInt64(_)
+            | CastOidToString(_)
             | CastOidToRegClass(_)
             | CastRegClassToOid(_)
             | CastOidToRegProc(_)
@@ -4189,8 +4255,10 @@ impl UnaryFunc {
             | CastStringToInt16(_)
             | CastStringToInt32(_)
             | CastStringToInt64(_)
+            | CastStringToInt2Vector(_)
             | CastStringToFloat32(_)
             | CastStringToFloat64(_)
+            | CastStringToOid(_)
             | CastStringToNumeric(_)
             | CastStringToDate(_)
             | CastStringToTime(_)
@@ -4212,6 +4280,9 @@ impl UnaryFunc {
             | CastIntervalToString(_)
             | CastIntervalToTime(_)
             | NegInterval(_)
+            | JustifyDays(_)
+            | JustifyHours(_)
+            | JustifyInterval(_)
             | CastUuidToString(_)
             | CastArrayToListOneDim(_)
             | CastTimestampToString(_)
@@ -4246,6 +4317,7 @@ impl UnaryFunc {
             | CastArrayToString { .. }
             | CastListToString { .. }
             | CastMapToString { .. }
+            | CastInt2VectorToString
             | TrimWhitespace
             | TrimLeadingWhitespace
             | TrimTrailingWhitespace
@@ -4255,7 +4327,7 @@ impl UnaryFunc {
             TimezoneTime { .. } => false,
             TimezoneTimestampTz(_) => false,
             TimezoneTimestamp(_) => false,
-            CastList1ToList2 { .. } | CastInPlace { .. } => false,
+            CastList1ToList2 { .. } | CastRecord1ToRecord2 { .. } | CastInPlace { .. } => false,
             JsonbTypeof | JsonbStripNulls | JsonbPretty | ListLength => false,
             ExtractInterval(_)
             | ExtractTime(_)
@@ -4338,6 +4410,9 @@ impl UnaryFunc {
             | CastIntervalToString(_)
             | CastIntervalToTime(_)
             | NegInterval(_)
+            | JustifyDays(_)
+            | JustifyHours(_)
+            | JustifyInterval(_)
             | CastVarCharToString(_) => unreachable!(),
             _ => false,
         }
@@ -4409,7 +4484,7 @@ impl UnaryFunc {
             | CastInt16ToFloat64(_)
             | CastInt16ToInt32(_)
             | CastInt16ToInt64(_)
-            | CastInt16ToOid(_)
+            | CastInt2VectorToArray(_)
             | CastInt16ToString(_)
             | CastInt32ToBool(_)
             | CastInt32ToFloat32(_)
@@ -4418,11 +4493,9 @@ impl UnaryFunc {
             | CastInt32ToInt64(_)
             | CastInt32ToString(_)
             | CastInt32ToOid(_)
-            | CastInt32ToRegClass(_)
-            | CastInt32ToRegProc(_)
-            | CastInt32ToRegType(_)
             | CastOidToInt32(_)
             | CastOidToInt64(_)
+            | CastOidToString(_)
             | CastOidToRegClass(_)
             | CastRegClassToOid(_)
             | CastOidToRegProc(_)
@@ -4463,9 +4536,11 @@ impl UnaryFunc {
             | CastStringToInt16(_)
             | CastStringToInt32(_)
             | CastStringToInt64(_)
+            | CastStringToInt2Vector(_)
             | CastStringToFloat32(_)
             | CastStringToFloat64(_)
             | CastStringToNumeric(_)
+            | CastStringToOid(_)
             | CastStringToDate(_)
             | CastStringToTime(_)
             | CastStringToTimestamp(_)
@@ -4486,6 +4561,9 @@ impl UnaryFunc {
             | CastIntervalToString(_)
             | CastIntervalToTime(_)
             | NegInterval(_)
+            | JustifyDays(_)
+            | JustifyHours(_)
+            | JustifyInterval(_)
             | CastUuidToString(_)
             | CastArrayToListOneDim(_)
             | CastTimestampToString(_)
@@ -4512,7 +4590,9 @@ impl UnaryFunc {
             CastJsonbToBool => f.write_str("jsonbtobool"),
             CastJsonbToNumeric(_) => f.write_str("jsonbtonumeric"),
             CastRecordToString { .. } => f.write_str("recordtostr"),
+            CastRecord1ToRecord2 { .. } => f.write_str("record1torecord2"),
             CastArrayToString { .. } => f.write_str("arraytostr"),
+            CastInt2VectorToString => f.write_str("int2vectortostr"),
             CastListToString { .. } => f.write_str("listtostr"),
             CastList1ToList2 { .. } => f.write_str("list1tolist2"),
             CastMapToString { .. } => f.write_str("maptostr"),
@@ -4808,14 +4888,15 @@ fn regexp_match_static<'a>(
     needle: &regex::Regex,
 ) -> Result<Datum<'a>, EvalError> {
     let mut row = Row::default();
+    let mut packer = row.packer();
     if needle.captures_len() > 1 {
         // The regex contains capture groups, so return an array containing the
         // matched text in each capture group, unless the entire match fails.
         // Individual capture groups may also be null if that group did not
         // participate in the match.
         match needle.captures(haystack.unwrap_str()) {
-            None => row.push(Datum::Null),
-            Some(captures) => row.push_array(
+            None => packer.push(Datum::Null),
+            Some(captures) => packer.push_array(
                 &[ArrayDimension {
                     lower_bound: 1,
                     length: captures.len() - 1,
@@ -4831,8 +4912,8 @@ fn regexp_match_static<'a>(
         // The regex contains no capture groups, so return a one-element array
         // containing the match, or null if there is no match.
         match needle.find(haystack.unwrap_str()) {
-            None => row.push(Datum::Null),
-            Some(mtch) => row.push_array(
+            None => packer.push(Datum::Null),
+            Some(mtch) => packer.push_array(
                 &[ArrayDimension {
                     lower_bound: 1,
                     length: 1,
@@ -5086,8 +5167,9 @@ where
     match &ty {
         Bool => strconv::format_bool(buf, d.unwrap_bool()),
         Int16 => strconv::format_int16(buf, d.unwrap_int16()),
-        Int32 | Oid | RegClass | RegProc | RegType => strconv::format_int32(buf, d.unwrap_int32()),
+        Int32 => strconv::format_int32(buf, d.unwrap_int32()),
         Int64 => strconv::format_int64(buf, d.unwrap_int64()),
+        Oid | RegClass | RegProc | RegType => strconv::format_oid(buf, d.unwrap_uint32()),
         Float32 => strconv::format_float32(buf, d.unwrap_float32()),
         Float64 => strconv::format_float64(buf, d.unwrap_float64()),
         Numeric { .. } => strconv::format_numeric(buf, &d.unwrap_numeric()),
@@ -5141,10 +5223,13 @@ where
                 stringify_datum(buf.nonnull_buffer(), d, value_type)
             }
         }),
+        Int2Vector => strconv::format_legacy_vector(buf, &d.unwrap_array().elements(), |buf, d| {
+            stringify_datum(buf.nonnull_buffer(), d, &ScalarType::Int16)
+        }),
     }
 }
 
-fn array_index<'a>(datums: &[Datum<'a>]) -> Datum<'a> {
+fn array_index<'a>(datums: &[Datum<'a>], offset: usize) -> Datum<'a> {
     let array = datums[0].unwrap_array();
     let dims = array.dims();
     if dims.len() != datums.len() - 1 {
@@ -5169,7 +5254,7 @@ fn array_index<'a>(datums: &[Datum<'a>]) -> Datum<'a> {
             return Datum::Null;
         }
 
-        final_idx = final_idx * length + (idx as usize - 1);
+        final_idx = final_idx * length + (idx as usize - offset);
     }
 
     array
@@ -5709,31 +5794,18 @@ fn digest_inner<'a>(
     Ok(Datum::Bytes(temp_storage.push_bytes(bytes)))
 }
 
-fn mz_render_typemod<'a>(
+fn mz_render_typmod<'a>(
     oid: Datum<'a>,
     typmod: Datum<'a>,
     temp_storage: &'a RowArena,
-) -> Datum<'a> {
-    let oid = oid.unwrap_int32();
-    let mut typmod = typmod.unwrap_int32();
-    let typmod_base = 65_536;
-
-    let inner = if matches!(Type::from_oid(oid as u32), Some(Type::Numeric { .. })) && typmod >= 0 {
-        typmod -= 4;
-        if typmod < 0 {
-            temp_storage.push_string(format!("({},{})", 65_535, typmod_base + typmod))
-        } else {
-            temp_storage.push_string(format!(
-                "({},{})",
-                typmod / typmod_base,
-                typmod % typmod_base
-            ))
-        }
-    } else {
-        ""
-    };
-
-    Datum::String(inner)
+) -> Result<Datum<'a>, EvalError> {
+    let oid = oid.unwrap_uint32();
+    let typmod = typmod.unwrap_int32();
+    let typ = Type::from_oid_and_typmod(oid, typmod);
+    let constraint = typ.as_ref().and_then(|typ| typ.constraint());
+    Ok(Datum::String(
+        temp_storage.push_string(constraint.display_or("").to_string()),
+    ))
 }
 
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
@@ -5755,7 +5827,11 @@ pub enum VariadicFunc {
     ArrayToString {
         elem_type: ScalarType,
     },
-    ArrayIndex,
+    ArrayIndex {
+        // Subtract `offset` from users' input to use 0-indexed arrays, i.e. is
+        // `1` in the case of `ScalarType::Array`.
+        offset: usize,
+    },
     ListCreate {
         // We need to know the element type to type empty lists.
         elem_type: ScalarType,
@@ -5811,7 +5887,7 @@ impl VariadicFunc {
             VariadicFunc::ArrayToString { elem_type } => {
                 eager!(array_to_string, elem_type, temp_storage)
             }
-            VariadicFunc::ArrayIndex => Ok(eager!(array_index)),
+            VariadicFunc::ArrayIndex { offset } => Ok(eager!(array_index, *offset)),
 
             VariadicFunc::ListCreate { .. } | VariadicFunc::RecordCreate { .. } => {
                 Ok(eager!(list_create, temp_storage))
@@ -5867,7 +5943,7 @@ impl VariadicFunc {
                 }
             }
             ArrayToString { .. } => ScalarType::String.nullable(true),
-            ArrayIndex => input_types[0]
+            ArrayIndex { .. } => input_types[0]
                 .scalar_type
                 .unwrap_array_element_type()
                 .clone()
@@ -5946,7 +6022,7 @@ impl fmt::Display for VariadicFunc {
             VariadicFunc::JsonbBuildObject => f.write_str("jsonb_build_object"),
             VariadicFunc::ArrayCreate { .. } => f.write_str("array_create"),
             VariadicFunc::ArrayToString { .. } => f.write_str("array_to_string"),
-            VariadicFunc::ArrayIndex => f.write_str("array_index"),
+            VariadicFunc::ArrayIndex { .. } => f.write_str("array_index"),
             VariadicFunc::ListCreate { .. } => f.write_str("list_create"),
             VariadicFunc::RecordCreate { .. } => f.write_str("record_create"),
             VariadicFunc::ListIndex => f.write_str("list_index"),

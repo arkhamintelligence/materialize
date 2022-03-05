@@ -292,11 +292,13 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
             let mut val = match &typ.scalar_type {
                 ScalarType::Bool => Value::Boolean(datum.unwrap_bool()),
                 ScalarType::Int16 => Value::Int(i32::from(datum.unwrap_int16())),
-                ScalarType::Int32
-                | ScalarType::Oid
+                ScalarType::Int32 => Value::Int(datum.unwrap_int32()),
+                ScalarType::Oid
                 | ScalarType::RegClass
                 | ScalarType::RegProc
-                | ScalarType::RegType => Value::Int(datum.unwrap_int32()),
+                | ScalarType::RegType => {
+                    Value::Fixed(4, datum.unwrap_uint32().to_le_bytes().into())
+                }
                 ScalarType::Int64 => Value::Long(datum.unwrap_int64()),
                 ScalarType::Float32 => Value::Float(datum.unwrap_float32()),
                 ScalarType::Float64 => Value::Double(datum.unwrap_float64()),
@@ -340,12 +342,13 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                 // client (https://issues.apache.org/jira/browse/AVRO-2123),
                 // so no one is likely to be using it, so we're just using
                 // our own very convenient format.
-                ScalarType::Interval => Value::Fixed(20, {
+                ScalarType::Interval => Value::Fixed(16, {
                     let iv = datum.unwrap_interval();
-                    let mut buf = Vec::with_capacity(24);
+                    let mut buf = Vec::with_capacity(16);
                     buf.extend(&iv.months.to_le_bytes());
-                    buf.extend(&iv.duration.to_le_bytes());
-                    debug_assert_eq!(buf.len(), 20);
+                    buf.extend(&iv.days.to_le_bytes());
+                    buf.extend(&iv.micros.to_le_bytes());
+                    debug_assert_eq!(buf.len(), 16);
                     buf
                 }),
                 ScalarType::Bytes => Value::Bytes(Vec::from(datum.unwrap_bytes())),
@@ -358,9 +361,11 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                 }
                 ScalarType::Jsonb => Value::Json(JsonbRef::from_datum(datum).to_serde_json()),
                 ScalarType::Uuid => Value::Uuid(datum.unwrap_uuid()),
-                ScalarType::Array(element_type) | ScalarType::List { element_type, .. } => {
-                    let list = match typ.scalar_type {
-                        ScalarType::Array(_) => datum.unwrap_array().elements(),
+                ty @ (ScalarType::Array(..) | ScalarType::Int2Vector | ScalarType::List { .. }) => {
+                    let list = match ty {
+                        ScalarType::Array(_) | ScalarType::Int2Vector => {
+                            datum.unwrap_array().elements()
+                        }
                         ScalarType::List { .. } => datum.unwrap_list(),
                         _ => unreachable!(),
                     };
@@ -372,7 +377,7 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                                 datum,
                                 ColumnType {
                                     nullable: true,
-                                    scalar_type: (**element_type).clone(),
+                                    scalar_type: ty.unwrap_collection_element_type().clone(),
                                 },
                             );
                             datum.avro()

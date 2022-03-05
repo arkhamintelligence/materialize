@@ -82,6 +82,26 @@ SELECT INTERVAL '1' MINUTE
 ----
 00:01:00
 
+query T
+SELECT INTERVAL '1 MIN'
+----
+00:01:00
+
+query T
+SELECT INTERVAL '1 MINS'
+----
+00:01:00
+
+query T
+SELECT INTERVAL '1 SECS'
+----
+00:00:01
+
+query T
+SELECT INTERVAL '1 SEC'
+----
+00:00:01
+
 statement ok
 CREATE TABLE iv_ish (
     b interval
@@ -265,12 +285,27 @@ SELECT INTERVAL '7' DAY + DATE '2000-01-01'
 2000-01-08 00:00:00
 
 query T
+SELECT INTERVAL '2 YRS 5 DAYS'
+----
+2 years 5 days
+
+query T
+SELECT INTERVAL '2 YR 5 DAYS'
+----
+2 years 5 days
+
+query T
 SELECT DATE '2000-01-01' + INTERVAL '7 5:4:3.2' DAY TO SECOND
 ----
 2000-01-08 05:04:03.2
 
 query T
 SELECT DATE '2000-01-01' + INTERVAL '4' HOUR
+----
+2000-01-01 04:00:00
+
+query T
+SELECT DATE '2000-01-01' + INTERVAL '4 HR'
 ----
 2000-01-01 04:00:00
 
@@ -725,11 +760,23 @@ SELECT current_timestamp > TIMESTAMP '2016-06-13 00:00:00'
 ----
 true
 
-query error calls to mz_logical_timestamp in in static or write queries are not supported
-CREATE VIEW timeview AS SELECT mz_logical_timestamp()
+statement ok
+CREATE VIEW logical_timestamp_view AS SELECT mz_logical_timestamp()
 
-query error now cannot be used in static queries
-CREATE VIEW timeview AS SELECT now()
+# Equivalent to running `SELECT mz_logical_timestamp()` directly and has the
+# same somewhat confusing output when there are no dependencies on any views.
+query T
+SELECT * FROM logical_timestamp_view
+----
+18446744073709551615
+
+statement ok
+CREATE VIEW now_view AS SELECT now() AS ts
+
+query B
+SELECT ts > TIMESTAMP '2016-06-13 00:00:00' FROM now_view
+----
+true
 
 query T
 SELECT (DATE '2000-01-01')::text
@@ -1060,7 +1107,7 @@ SELECT '2007-02-01'::date
 query T
 SELECT '-1-2 3 -4:5:6.7'::interval;
 ----
--1 year -2 months +2 days +19:54:53.3
+-1 years -2 months +3 days -04:05:06.7
 
 query T
 SELECT '01:23:45'::time;
@@ -1087,7 +1134,7 @@ SELECT (date '2007-02-01')::text
 query T
 SELECT (interval '-1-2 3 -4:5:6.7')::text;
 ----
--1 year -2 months +2 days +19:54:53.3
+-1 years -2 months +3 days -04:05:06.7
 
 query T
 SELECT (time '01:23:45')::text;

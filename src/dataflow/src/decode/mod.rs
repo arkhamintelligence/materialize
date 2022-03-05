@@ -132,20 +132,20 @@ impl PreDelimitedFormat {
                     .map_err(|_| DecodeError::Text("Failed to decode UTF-8".to_string()))?;
                 Ok(Some(Row::pack(Some(Datum::String(s)))))
             }
-            PreDelimitedFormat::Regex(regex, row_packer) => {
+            PreDelimitedFormat::Regex(regex, row_buf) => {
                 let s = std::str::from_utf8(bytes)
                     .map_err(|_| DecodeError::Text("Failed to decode UTF-8".to_string()))?;
                 let captures = match regex.captures(s) {
                     Some(captures) => captures,
                     None => return Ok(None),
                 };
-                row_packer.extend(
+                row_buf.packer().extend(
                     captures
                         .iter()
                         .skip(1)
                         .map(|c| Datum::from(c.map(|c| c.as_str()))),
                 );
-                Ok(Some(row_packer.finish_and_reuse()))
+                Ok(Some(row_buf.clone()))
             }
             PreDelimitedFormat::Protobuf(pb) => pb.get_value(bytes).transpose(),
         }
@@ -367,13 +367,7 @@ where
 
     let dist: fn(&SourceOutput<Option<Vec<u8>>, Option<Vec<u8>>>) -> _ = match envelope {
         SourceEnvelope::Debezium(_) => |x| x.partition.hashed(),
-        _ => |x| {
-            if let Some(position) = x.position {
-                position.hashed()
-            } else {
-                x.value.hashed()
-            }
-        },
+        _ => |x| x.position.hashed(),
     };
     let results = stream.unary_frontier(Exchange::new(dist), &op_name, move |_, _| {
         move |input, output| {
@@ -505,7 +499,8 @@ where
                                     } else if matches!(&value, Ok(_)) {
                                         n_successes += 1;
                                     }
-                                    let position = n_seen.next();
+                                    // `RangeFrom` `Iterator`'s never end
+                                    let position = n_seen.next().unwrap();
                                     let metadata = to_metadata_row(
                                         &metadata_items,
                                         partition.clone(),
@@ -536,84 +531,68 @@ where
                         &value_buf
                     };
 
-                    if value.is_empty() {
+                    let value_bytes_remaining = &mut value.as_slice();
+                    // The intent is that the below loop runs as long as there are more bytes to decode.
+                    //
+                    // We'd like to be able to write `while !value_cursor.empty()`
+                    // here, but that runs into borrow checker issues, so we use `loop`
+                    // and break manually.
+                    loop {
+                        let old_value_cursor = *value_bytes_remaining;
+                        let value = match value_decoder.next(value_bytes_remaining) {
+                            Err(e) => Err(e),
+                            Ok(None) => {
+                                let leftover = value_bytes_remaining.to_vec();
+                                value_buf = leftover;
+                                break;
+                            }
+                            Ok(Some(value)) => Ok(value),
+                        };
+
+                        // If the decoders decoded a message, they need to have made progress consuming the bytes.
+                        // Otherwise, we risk going into an infinite loop.
+                        assert!(old_value_cursor != *value_bytes_remaining || value.is_err());
+
+                        let is_err = value.is_err();
+                        if is_err {
+                            n_errors += 1;
+                        } else if matches!(&value, Ok(_)) {
+                            n_successes += 1;
+                        }
+                        // `RangeFrom` `Iterator`'s never end
+                        let position = n_seen.next().unwrap();
                         let metadata = to_metadata_row(
                             &metadata_items,
                             partition.clone(),
-                            None,
+                            position,
                             *upstream_time_millis,
                         );
-                        session.give(DecodeResult {
-                            key: None,
-                            value: None,
-                            position: None,
-                            upstream_time_millis: *upstream_time_millis,
-                            partition: partition.clone(),
-                            metadata,
-                        });
-                    } else {
-                        let value_bytes_remaining = &mut value.as_slice();
-                        // The intent is that the below loop runs as long as there are more bytes to decode.
-                        //
-                        // We'd like to be able to write `while !value_cursor.empty()`
-                        // here, but that runs into borrow checker issues, so we use `loop`
-                        // and break manually.
-                        loop {
-                            let old_value_cursor = *value_bytes_remaining;
-                            let value = match value_decoder.next(value_bytes_remaining) {
-                                Err(e) => Err(e),
-                                Ok(None) => {
-                                    let leftover = value_bytes_remaining.to_vec();
-                                    value_buf = leftover;
-                                    break;
-                                }
-                                Ok(Some(value)) => Ok(value),
-                            };
 
-                            // If the decoders decoded a message, they need to have made progress consuming the bytes.
-                            // Otherwise, we risk going into an infinite loop.
-                            assert!(old_value_cursor != *value_bytes_remaining || value.is_err());
-
-                            let is_err = value.is_err();
-                            if is_err {
-                                n_errors += 1;
-                            } else if matches!(&value, Ok(_)) {
-                                n_successes += 1;
-                            }
-                            let position = n_seen.next();
-                            let metadata = to_metadata_row(
-                                &metadata_items,
-                                partition.clone(),
+                        if value_bytes_remaining.is_empty() {
+                            session.give(DecodeResult {
+                                key: None,
+                                value: Some(value),
                                 position,
-                                *upstream_time_millis,
-                            );
-
-                            if value_bytes_remaining.is_empty() {
-                                session.give(DecodeResult {
-                                    key: None,
-                                    value: Some(value),
-                                    position,
-                                    upstream_time_millis: *upstream_time_millis,
-                                    partition: partition.clone(),
-                                    metadata,
-                                });
-                                value_buf = vec![];
-                                break;
-                            } else {
-                                session.give(DecodeResult {
-                                    key: None,
-                                    value: Some(value),
-                                    position,
-                                    upstream_time_millis: *upstream_time_millis,
-                                    partition: partition.clone(),
-                                    metadata,
-                                });
-                            }
-                            if is_err {
-                                // If decoding has gone off the rails, we can no longer be sure that the delimiters are correct, so it
-                                // makes no sense to keep going.
-                                break;
-                            }
+                                upstream_time_millis: *upstream_time_millis,
+                                partition: partition.clone(),
+                                metadata,
+                            });
+                            value_buf = vec![];
+                            break;
+                        } else {
+                            session.give(DecodeResult {
+                                key: None,
+                                value: Some(value),
+                                position,
+                                upstream_time_millis: *upstream_time_millis,
+                                partition: partition.clone(),
+                                metadata,
+                            });
+                        }
+                        if is_err {
+                            // If decoding has gone off the rails, we can no longer be sure that the delimiters are correct, so it
+                            // makes no sense to keep going.
+                            break;
                         }
                     }
                 }
@@ -633,19 +612,19 @@ where
 fn to_metadata_row(
     metadata_items: &[IncludedColumnSource],
     partition: PartitionId,
-    position: Option<i64>,
+    position: i64,
     upstream_time_millis: Option<i64>,
 ) -> Row {
     let mut row = Row::default();
+    let mut packer = row.packer();
     match partition {
         PartitionId::Kafka(partition) => {
             for item in metadata_items.iter() {
                 match item {
-                    IncludedColumnSource::Partition => row.push(Datum::from(partition)),
-                    IncludedColumnSource::Offset | IncludedColumnSource::DefaultPosition => row
-                        .push(Datum::from(
-                            position.expect("kafka sources always have position"),
-                        )),
+                    IncludedColumnSource::Partition => packer.push(Datum::from(partition)),
+                    IncludedColumnSource::Offset | IncludedColumnSource::DefaultPosition => {
+                        packer.push(Datum::from(position))
+                    }
                     IncludedColumnSource::Timestamp => {
                         let ts =
                             upstream_time_millis.expect("kafka sources always have upstream_time");
@@ -654,7 +633,7 @@ fn to_metadata_row(
                             millis = 1000 - millis;
                         }
 
-                        row.push(Datum::from(NaiveDateTime::from_timestamp(
+                        packer.push(Datum::from(NaiveDateTime::from_timestamp(
                             secs,
                             millis * 1_000_000,
                         )))
@@ -666,9 +645,7 @@ fn to_metadata_row(
         PartitionId::None => {
             for item in metadata_items.iter() {
                 match item {
-                    IncludedColumnSource::DefaultPosition => row.push(Datum::from(
-                        position.expect("kafka sources always have position"),
-                    )),
+                    IncludedColumnSource::DefaultPosition => packer.push(Datum::from(position)),
                     _ => unreachable!("Only Kafka supports non-defaultposition metadata items"),
                 }
             }

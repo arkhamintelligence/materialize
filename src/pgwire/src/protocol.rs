@@ -30,7 +30,7 @@ use mz_coord::session::{
     TransactionStatus,
 };
 use mz_coord::ExecuteResponse;
-use mz_dataflow_types::PeekResponse;
+use mz_dataflow_types::PeekResponseUnary;
 use mz_frontegg_auth::FronteggAuthentication;
 use mz_ore::cast::CastFrom;
 use mz_ore::netio::AsyncReady;
@@ -38,7 +38,7 @@ use mz_ore::str::StrExt;
 use mz_pgcopy::CopyFormatParams;
 use mz_repr::{Datum, RelationDesc, RelationType, Row, RowArena, ScalarType};
 use mz_sql::ast::display::AstDisplay;
-use mz_sql::ast::{FetchDirection, Ident, Raw, Statement};
+use mz_sql::ast::{FetchDirection, Ident, NoticeSeverity, Raw, Statement};
 use mz_sql::plan::{CopyFormat, CopyParams, ExecuteTimeout, StatementDesc};
 
 use crate::codec::FramedConn;
@@ -1115,18 +1115,18 @@ where
                 let row_desc =
                     row_desc.expect("missing row description for ExecuteResponse::SendingRows");
                 match rx.await {
-                    PeekResponse::Canceled => {
+                    PeekResponseUnary::Canceled => {
                         self.error(ErrorResponse::error(
                             SqlState::QUERY_CANCELED,
                             "canceling statement due to user request",
                         ))
                         .await
                     }
-                    PeekResponse::Error(text) => {
+                    PeekResponseUnary::Error(text) => {
                         self.error(ErrorResponse::error(SqlState::INTERNAL_ERROR, text))
                             .await
                     }
-                    PeekResponse::Rows(rows) => {
+                    PeekResponseUnary::Rows(rows) => {
                         self.send_rows(
                             row_desc,
                             portal_name,
@@ -1216,7 +1216,7 @@ where
                     ExecuteResponse::Tailing { rx } => rx,
                     ExecuteResponse::SendingRows(rx) => match rx.await {
                         // TODO(mjibson): This logic is duplicated from SendingRows. Dedup?
-                        PeekResponse::Canceled => {
+                        PeekResponseUnary::Canceled => {
                             return self
                                 .error(ErrorResponse::error(
                                     SqlState::QUERY_CANCELED,
@@ -1224,12 +1224,12 @@ where
                                 ))
                                 .await;
                         }
-                        PeekResponse::Error(text) => {
+                        PeekResponseUnary::Error(text) => {
                             return self
                                 .error(ErrorResponse::error(SqlState::INTERNAL_ERROR, text))
                                 .await;
                         }
-                        PeekResponse::Rows(rows) => {
+                        PeekResponseUnary::Rows(rows) => {
                             let (tx, rx) = unbounded_channel();
                             tx.send(rows).expect("send must succeed");
                             rx
@@ -1261,6 +1261,27 @@ where
             ExecuteResponse::Prepare => command_complete!("PREPARE"),
             ExecuteResponse::Deallocate { all } => {
                 command_complete!("DEALLOCATE{}", if all { " ALL" } else { "" })
+            }
+            ExecuteResponse::Raise { severity } => {
+                let msg = match severity {
+                    NoticeSeverity::Debug => {
+                        ErrorResponse::debug(SqlState::WARNING, "raised a test debug")
+                    }
+                    NoticeSeverity::Info => {
+                        ErrorResponse::info(SqlState::WARNING, "raised a test info")
+                    }
+                    NoticeSeverity::Log => {
+                        ErrorResponse::log(SqlState::WARNING, "raised a test log")
+                    }
+                    NoticeSeverity::Notice => {
+                        ErrorResponse::notice(SqlState::WARNING, "raised a test notice")
+                    }
+                    NoticeSeverity::Warning => {
+                        ErrorResponse::warning(SqlState::WARNING, "raised a test warning")
+                    }
+                };
+                self.send(msg).await?;
+                command_complete!("RAISE")
             }
         }
     }

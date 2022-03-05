@@ -961,12 +961,13 @@ fn generate_series_ts(
     step: Interval,
     conv: fn(NaiveDateTime) -> Datum<'static>,
 ) -> Result<impl Iterator<Item = (Row, Diff)>, EvalError> {
-    if step.months == 0 && step.duration == 0 {
+    let normalized_step = step.as_microseconds();
+    if normalized_step == 0 {
         return Err(EvalError::InvalidParameterValue(
             "step size cannot equal zero".to_owned(),
         ));
     }
-    let rev = step.duration < 0;
+    let rev = normalized_step < 0;
 
     let tsri = TimestampRangeStepInclusive {
         state: start,
@@ -1115,8 +1116,8 @@ pub fn csv_extract(a: Datum, n_cols: usize) -> impl Iterator<Item = (Row, Diff)>
         .from_reader(bytes);
     csv_reader.into_records().filter_map(move |res| match res {
         Ok(sr) if sr.len() == n_cols => {
-            row.extend(sr.iter().map(Datum::String));
-            Some((row.finish_and_reuse(), 1))
+            row.packer().extend(sr.iter().map(Datum::String));
+            Some((row.clone(), 1))
         }
         _ => None,
     })

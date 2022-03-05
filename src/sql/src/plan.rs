@@ -36,12 +36,12 @@ use serde::{Deserialize, Serialize};
 use mz_dataflow_types::{
     sinks::SinkConnectorBuilder, sinks::SinkEnvelope, sources::SourceConnector,
 };
-use mz_expr::{GlobalId, MirRelationExpr, RowSetFinishing};
+use mz_expr::{GlobalId, MirRelationExpr, MirScalarExpr, RowSetFinishing};
 use mz_ore::now::{self, NOW_ZERO};
-use mz_repr::{ColumnName, Diff, RelationDesc, Row, ScalarType, Timestamp};
+use mz_repr::{ColumnName, Diff, RelationDesc, Row, ScalarType};
 
 use crate::ast::{
-    ExplainOptions, ExplainStage, Expr, FetchDirection, ObjectType, Raw, Statement,
+    ExplainOptions, ExplainStage, Expr, FetchDirection, NoticeSeverity, ObjectType, Raw, Statement,
     TransactionAccessMode,
 };
 use crate::catalog::CatalogType;
@@ -112,6 +112,7 @@ pub enum Plan {
     Prepare(PreparePlan),
     Execute(ExecutePlan),
     Deallocate(DeallocatePlan),
+    Raise(RaisePlan),
 }
 
 #[derive(Debug)]
@@ -237,7 +238,7 @@ pub struct PeekPlan {
 pub struct TailPlan {
     pub from: TailFrom,
     pub with_snapshot: bool,
-    pub ts: Option<Timestamp>,
+    pub ts: Option<MirScalarExpr>,
     pub copy_to: Option<CopyFormat>,
     pub emit_progress: bool,
 }
@@ -360,6 +361,11 @@ pub struct DeallocatePlan {
     pub name: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct RaisePlan {
+    pub severity: NoticeSeverity,
+}
+
 #[derive(Clone, Debug)]
 pub struct Table {
     pub create_sql: String,
@@ -416,8 +422,11 @@ pub enum PeekWhen {
     /// The peek should occur at the latest possible timestamp that allows the
     /// peek to complete immediately.
     Immediately,
-    /// The peek should occur at the specified timestamp.
-    AtTimestamp(Timestamp),
+    /// The peek should occur at the timestamp described by the specified
+    /// expression.
+    ///
+    /// The expression may have any type.
+    AtTimestamp(MirScalarExpr),
 }
 
 #[derive(Debug)]

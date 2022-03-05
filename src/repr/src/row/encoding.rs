@@ -27,7 +27,7 @@ use crate::gen::row::{
     ProtoArray, ProtoArrayDimension, ProtoDate, ProtoDatum, ProtoDatumOther, ProtoDict,
     ProtoDictElement, ProtoInterval, ProtoNumeric, ProtoRow, ProtoTime, ProtoTimestamp,
 };
-use crate::{Datum, Row};
+use crate::{Datum, Row, RowPacker};
 
 impl Codec for Row {
     fn codec_name() -> String {
@@ -66,6 +66,7 @@ impl<'a> From<Datum<'a>> for ProtoDatum {
             Datum::True => DatumType::Other(ProtoDatumOther::True.into()),
             Datum::Int16(x) => DatumType::Int16(x.into()),
             Datum::Int32(x) => DatumType::Int32(x),
+            Datum::UInt32(x) => DatumType::Uint32(x),
             Datum::Int64(x) => DatumType::Int64(x),
             Datum::Float32(x) => DatumType::Float32(x.into_inner()),
             Datum::Float64(x) => DatumType::Float64(x.into_inner()),
@@ -94,17 +95,11 @@ impl<'a> From<Datum<'a>> for ProtoDatum {
                     is_tz: true,
                 })
             }
-            Datum::Interval(x) => {
-                let duration = x.duration.to_le_bytes();
-                let (mut duration_lo, mut duration_hi) = ([0u8; 8], [0u8; 8]);
-                duration_lo.copy_from_slice(&duration[..8]);
-                duration_hi.copy_from_slice(&duration[8..]);
-                DatumType::Interval(ProtoInterval {
-                    months: x.months,
-                    duration_lo: i64::from_le_bytes(duration_lo),
-                    duration_hi: i64::from_le_bytes(duration_hi),
-                })
-            }
+            Datum::Interval(x) => DatumType::Interval(ProtoInterval {
+                months: x.months,
+                days: x.days,
+                micros: x.micros,
+            }),
             Datum::Bytes(x) => DatumType::Bytes(x.to_vec()),
             Datum::String(x) => DatumType::String(x.to_owned()),
             Datum::Array(x) => DatumType::Array(ProtoArray {
@@ -172,7 +167,7 @@ impl From<&Row> for ProtoRow {
     }
 }
 
-impl Row {
+impl RowPacker<'_> {
     fn try_push_proto(&mut self, x: &ProtoDatum) -> Result<(), String> {
         match &x.datum_type {
             Some(DatumType::Other(o)) => match ProtoDatumOther::from_i32(*o) {
@@ -196,6 +191,7 @@ impl Row {
             }
             Some(DatumType::Int32(x)) => self.push(Datum::Int32(*x)),
             Some(DatumType::Int64(x)) => self.push(Datum::Int64(*x)),
+            Some(DatumType::Uint32(x)) => self.push(Datum::UInt32(*x)),
             Some(DatumType::Float32(x)) => self.push(Datum::Float32((*x).into())),
             Some(DatumType::Float64(x)) => self.push(Datum::Float64((*x).into())),
             Some(DatumType::Bytes(x)) => self.push(Datum::Bytes(x)),
@@ -224,16 +220,11 @@ impl Row {
                     self.push(Datum::Timestamp(datetime));
                 }
             }
-            Some(DatumType::Interval(x)) => {
-                let mut duration = [0u8; 16];
-                duration[..8].copy_from_slice(&x.duration_lo.to_le_bytes());
-                duration[8..].copy_from_slice(&x.duration_hi.to_le_bytes());
-                let duration = i128::from_le_bytes(duration);
-                self.push(Datum::Interval(Interval {
-                    months: x.months,
-                    duration,
-                }))
-            }
+            Some(DatumType::Interval(x)) => self.push(Datum::Interval(Interval {
+                months: x.months,
+                days: x.days,
+                micros: x.micros,
+            })),
             Some(DatumType::List(x)) => self.push_list_with(|row| -> Result<(), String> {
                 for d in x.datums.iter() {
                     row.try_push_proto(d)?;
@@ -289,8 +280,9 @@ impl TryFrom<&ProtoRow> for Row {
     fn try_from(x: &ProtoRow) -> Result<Self, Self::Error> {
         // TODO: Try to pre-size this.
         let mut row = Row::default();
+        let mut packer = row.packer();
         for d in x.datums.iter() {
-            row.try_push_proto(d)?;
+            packer.try_push_proto(d)?;
         }
         Ok(row)
     }
@@ -312,7 +304,9 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let mut row = Row::pack(vec![
+        let mut row = Row::default();
+        let mut packer = row.packer();
+        packer.extend([
             Datum::False,
             Datum::True,
             Datum::Int16(1),
@@ -331,7 +325,8 @@ mod tests {
             )),
             Datum::Interval(Interval {
                 months: 24,
-                duration: 25,
+                days: 42,
+                micros: 25,
             }),
             Datum::Bytes(&[26, 27]),
             Datum::String("28"),
@@ -344,24 +339,25 @@ mod tests {
             Datum::Dummy,
             Datum::Null,
         ]);
-        row.push_array(
-            &[ArrayDimension {
-                lower_bound: 2,
-                length: 2,
-            }],
-            vec![Datum::Int32(31), Datum::Int32(32)],
-        )
-        .expect("valid array");
-        row.push_list_with(|row| {
-            row.push(Datum::String("33"));
-            row.push_list_with(|row| {
-                row.push(Datum::String("34"));
-                row.push(Datum::String("35"));
+        packer
+            .push_array(
+                &[ArrayDimension {
+                    lower_bound: 2,
+                    length: 2,
+                }],
+                vec![Datum::Int32(31), Datum::Int32(32)],
+            )
+            .expect("valid array");
+        packer.push_list_with(|packer| {
+            packer.push(Datum::String("33"));
+            packer.push_list_with(|packer| {
+                packer.push(Datum::String("34"));
+                packer.push(Datum::String("35"));
             });
-            row.push(Datum::String("36"));
-            row.push(Datum::String("37"));
+            packer.push(Datum::String("36"));
+            packer.push(Datum::String("37"));
         });
-        row.push_dict_with(|row| {
+        packer.push_dict_with(|row| {
             // Add a bunch of data to the hash to ensure we don't get a
             // HashMap's random iteration anywhere in the encode/decode path.
             let mut i = 38;

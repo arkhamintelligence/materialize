@@ -8,14 +8,19 @@ menu:
 
 `interval` data expresses a duration of time.
 
+`interval` data keeps months, days, and microseconds completely separate and will not try to convert between any of
+those fields when comparing `interval`s. This may lead to some unexpected behavior. For example `1 month` is considered
+greater than `100 days`. See ['justify_days'](../../functions/justify-days), ['justify_hours'](../../functions/justify-hours), and
+['justify_interval'](../../functions/justify-interval) to explicitly convert between these fields.
+
 Detail | Info
 -------|-----
 **Quick Syntax** | `INTERVAL '1' MINUTE` <br/> `INTERVAL '1-2 3 4:5:6.7'` <br/>`INTERVAL '1 year 2.3 days 4.5 seconds'`
 **Size** | 20 bytes
 **Catalog name** | `pg_catalog.interval`
 **OID** | 1186
-**Min value** | -178956970 years -8 months -2236962133 days -08:59:59.999999
-**Max value** | 178956970 years 7 months 2236962132 days 07:59:59.999999
+**Min value** | -178956970 years -8 months -2147483648 days -2147483648:59:59.999999
+**Max value** | 178956970 years 7 months 2147483647 days 2147483647:59:59.999999
 
 ## Syntax
 
@@ -155,7 +160,7 @@ SELECT INTERVAL '-1 day 2:3:4.5' AS interval_n;
 ```nofmt
  interval_n
 -------------
- -21:56:55.5
+ -1 days +02:03:04.5
 ```
 
 ### Truncating interval

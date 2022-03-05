@@ -259,6 +259,7 @@ impl<'a> Parser<'a> {
                 Token::Keyword(PREPARE) => Ok(self.parse_prepare()?),
                 Token::Keyword(EXECUTE) => Ok(self.parse_execute()?),
                 Token::Keyword(DEALLOCATE) => Ok(self.parse_deallocate()?),
+                Token::Keyword(RAISE) => Ok(self.parse_raise()?),
                 Token::Keyword(kw) => parser_err!(
                     self,
                     self.peek_prev_pos(),
@@ -756,6 +757,20 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::RParen)?;
             Ok(Expr::Row { exprs })
         }
+    }
+
+    fn parse_composite_type_definition(&mut self) -> Result<Vec<ColumnDef<Raw>>, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let fields = self.parse_comma_separated(|parser| {
+            Ok(ColumnDef {
+                name: parser.parse_identifier()?,
+                data_type: parser.parse_data_type()?,
+                collation: None,
+                options: vec![],
+            })
+        })?;
+        self.expect_token(&Token::RParen)?;
+        Ok(fields)
     }
 
     // Parse calls to trim(), which can take the form:
@@ -2356,21 +2371,30 @@ impl<'a> Parser<'a> {
         self.expect_keyword(TYPE)?;
         let name = self.parse_object_name()?;
         self.expect_keyword(AS)?;
-        let as_type = match self.expect_one_of_keywords(&[LIST, MAP])? {
-            LIST => CreateTypeAs::List,
-            MAP => CreateTypeAs::Map,
-            _ => unreachable!(),
-        };
 
-        self.expect_token(&Token::LParen)?;
-        let with_options = self.parse_comma_separated(Parser::parse_data_type_option)?;
-        self.expect_token(&Token::RParen)?;
+        match self.parse_one_of_keywords(&[LIST, MAP]) {
+            Some(as_type) => {
+                self.expect_token(&Token::LParen)?;
+                let with_options = self.parse_comma_separated(Parser::parse_data_type_option)?;
+                self.expect_token(&Token::RParen)?;
 
-        Ok(Statement::CreateType(CreateTypeStatement {
-            name,
-            as_type,
-            with_options,
-        }))
+                let as_type = match as_type {
+                    LIST => CreateTypeAs::List { with_options },
+                    MAP => CreateTypeAs::Map { with_options },
+                    _ => unreachable!(),
+                };
+
+                Ok(Statement::CreateType(CreateTypeStatement { name, as_type }))
+            }
+            None => {
+                let column_defs = self.parse_composite_type_definition()?;
+
+                Ok(Statement::CreateType(CreateTypeStatement {
+                    name,
+                    as_type: CreateTypeAs::Record { column_defs },
+                }))
+            }
+        }
     }
 
     fn parse_data_type_option(&mut self) -> Result<SqlOption<Raw>, ParserError> {
@@ -4472,6 +4496,22 @@ impl<'a> Parser<'a> {
             count,
             options,
         }))
+    }
+
+    /// Parse a `RAISE` statement, assuming that the `RAISE` token
+    /// has already been consumed.
+    fn parse_raise(&mut self) -> Result<Statement<Raw>, ParserError> {
+        let severity = match self.parse_one_of_keywords(&[DEBUG, INFO, LOG, NOTICE, WARNING]) {
+            Some(DEBUG) => NoticeSeverity::Debug,
+            Some(INFO) => NoticeSeverity::Info,
+            Some(LOG) => NoticeSeverity::Log,
+            Some(NOTICE) => NoticeSeverity::Notice,
+            Some(WARNING) => NoticeSeverity::Warning,
+            Some(_) => unreachable!(),
+            None => self.expected(self.peek_pos(), "severity level", self.peek_token())?,
+        };
+
+        Ok(Statement::Raise(RaiseStatement { severity }))
     }
 }
 

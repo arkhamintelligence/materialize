@@ -22,7 +22,7 @@ use mz_dataflow_types::sources::{AwsExternalId, SourceConnector};
 use mz_build_info::{BuildInfo, DUMMY_BUILD_INFO};
 use mz_expr::{DummyHumanizer, ExprHumanizer, GlobalId, MirScalarExpr};
 use mz_ore::now::{EpochMillis, NowFn, NOW_ZERO};
-use mz_repr::{RelationDesc, ScalarType};
+use mz_repr::{ColumnName, RelationDesc, ScalarType};
 use mz_sql_parser::ast::{Expr, Raw};
 use uuid::Uuid;
 
@@ -56,9 +56,6 @@ use crate::plan::statement::StatementDesc;
 /// [`get_item`]: Catalog::resolve_item
 /// [`resolve_item`]: SessionCatalog::resolve_item
 pub trait SessionCatalog: fmt::Debug + ExprHumanizer {
-    /// Returns the search path used by the catalog.
-    fn search_path(&self, include_system_schemas: bool) -> Vec<&str>;
-
     /// Returns the name of the user who is issuing the query.
     fn user(&self) -> &str;
 
@@ -347,6 +344,9 @@ pub enum CatalogType {
     Numeric,
     Oid,
     Pseudo,
+    Record {
+        fields: Vec<(ColumnName, GlobalId)>,
+    },
     RegClass,
     RegProc,
     RegType,
@@ -356,6 +356,7 @@ pub enum CatalogType {
     TimestampTz,
     Uuid,
     VarChar,
+    Int2Vector,
 }
 
 /// An error returned by the catalog.
@@ -433,10 +434,6 @@ lazy_static! {
 }
 
 impl SessionCatalog for DummyCatalog {
-    fn search_path(&self, _: bool) -> Vec<&str> {
-        vec!["dummy"]
-    }
-
     fn user(&self) -> &str {
         "dummy"
     }

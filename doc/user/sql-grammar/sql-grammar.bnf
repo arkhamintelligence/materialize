@@ -71,6 +71,12 @@ create_source_kafka ::=
     ( ('KEY' | 'PARTITION' | 'OFFSET' | 'TIMESTAMP') ('AS' name)? )*
   )?
   ('ENVELOPE' ('NONE' | 'DEBEZIUM' ('UPSERT')? | 'UPSERT'))?
+create_source_kinesis ::=
+  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
+  ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
+  'FROM' 'KINESIS ARN' arn with_options?
+  'FORMAT' format_spec
+  ('ENVELOPE NONE')?
 create_source_csv_file ::=
   'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
   ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
@@ -84,39 +90,19 @@ create_source_json ::=
   'FROM' 'FILE' path ('COMPRESSION' ('NONE' | 'GZIP'))? with_options?
   'FORMAT' 'BYTES'
   ('ENVELOPE NONE')?
-create_source_csv_kinesis ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
-  ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
-  'FROM' 'KINESIS ARN' arn with_options?
-  'FORMAT' 'CSV WITH' ( 'HEADER' ( '(' col_name (',' col_name)* ')' )? | n 'COLUMNS')
-  ('DELIMITED BY' char)?
-  ('ENVELOPE NONE')?
-create_source_json_kinesis ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
-  ('(' (col_name) ( ( ',' col_name ) )* ')')?
-  'FROM' 'KINESIS ARN' arn with_options?
-  'FORMAT' 'BYTES'
-  ('ENVELOPE NONE')?
 create_source_postgres ::=
   'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
   'FROM' 'POSTGRES'
   'CONNECTION' connection_info
   'PUBLICATION' publication_name
   ('WITH timestamp_frequency_ms =' int)?
-create_source_protobuf_kinesis ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
-  ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
-  'FROM' 'KINESIS ARN' arn with_options?
-  'FORMAT' 'PROTOBUF MESSAGE' message_name
-  'USING SCHEMA' ('FILE' schema_file_path | inline_schema)
-  ('ENVELOPE NONE')?
 create_source_pubnub_text ::=
   'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
   ('(' (col_name) ( ( ',' col_name ) )* ')')?
   'FROM' 'PUBNUB' 'SUBSCRIBE KEY' key 'CHANNEL' channel
   'FORMAT' 'TEXT'
   ('ENVELOPE' 'NONE')?
-create_source_s3_text ::=
+create_source_s3 ::=
   'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
   ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
   'FROM' 'S3' 'DISCOVER OBJECTS'
@@ -131,45 +117,8 @@ create_source_s3_text ::=
   )*
   ('COMPRESSION' ('NONE' | 'GZIP'))?
   with_options?
-  ('FORMAT' (
-    'REGEX' regex |
-    'TEXT' |
-    'BYTES'
-  ))
+  'FORMAT' format_spec
   ('ENVELOPE NONE')?
-create_source_s3_json ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
-  'FROM' 'S3' 'DISCOVER OBJECTS'
-  ('MATCHING' pattern)?
-  'USING' (
-      'BUCKET SCAN' bucket_name |
-      'SQS NOTIFICATIONS' queue_name
-  ) ( ',' (
-      'BUCKET SCAN' bucket_name |
-      'SQS NOTIFICATIONS' queue_name
-    )
-  )*
-  ('COMPRESSION' ('NONE' | 'GZIP'))?
-  with_options?
-  'FORMAT' ('TEXT' | 'BYTES')
-  ('ENVELOPE NONE')?
-create_source_s3_csv ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')?
-  src_name ( '(' col_name (',' col_name)* ')' ( ',' key_constraint )? )?
-  'FROM' 'S3' 'DISCOVER OBJECTS'
-  ('MATCHING' pattern)?
-  'USING' (
-    'BUCKET SCAN' bucket_name |
-    'SQS NOTIFICATIONS' queue_name
-    ) ( ',' (
-    'BUCKET SCAN' bucket_name |
-    'SQS NOTIFICATIONS' queue_name
-      )
-    )*
-    ('COMPRESSION' ('NONE' | 'GZIP'))?
-    with_options?
-    'FORMAT' 'CSV' 'WITH' column_count 'COLUMNS'
-    ('ENVELOPE NONE')?
 create_source_text ::=
   'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
   ('(' (col_name) ( ( ',' col_name ) )* ( ',' key_constraint )? ')')?
@@ -180,12 +129,6 @@ create_source_text ::=
     'BYTES'
   )
 ('ENVELOPE NONE')?
-create_source_text_kinesis ::=
-  'CREATE' 'MATERIALIZED'? 'SOURCE' ('IF NOT EXISTS')? src_name
-  ('(' (col_name) ( ( ',' col_name ) )* ')')?
-  'FROM' 'KINESIS ARN' arn with_options?
-  'FORMAT' ('BYTES' | 'TEXT')
-  ('ENVELOPE' 'NONE')?
 create_type ::=
     'CREATE' 'TYPE' type_name 'AS' ( 'LIST' | 'MAP' ) '(' ( field '=' val ) ( ( ',' field '=' val ) )* ')'
 create_user ::=
@@ -261,6 +204,17 @@ format_spec ::=
   'CSV WITH' ('HEADER' ( '(' col_name (',' col_name)* ')' )? | n 'COLUMNS') ('DELIMITED BY' char)? |
   'TEXT' |
   'BYTES'
+kinesis_format_spec ::=
+  'PROTOBUF MESSAGE' message_name 'USING SCHEMA FILE' path |
+  'REGEX' regex |
+  'CSV WITH' ('HEADER' ( '(' col_name (',' col_name)* ')' )? | n 'COLUMNS') ('DELIMITED BY' char)? |
+  'TEXT' |
+  'BYTES'
+s3_format_spec ::=
+  'REGEX' regex |
+  'CSV WITH' ('HEADER' ( '(' col_name (',' col_name)* ')' )? | n 'COLUMNS') ('DELIMITED BY' char)? |
+  'TEXT' |
+  'BYTES'
 sink_format_spec ::=
   'AVRO USING' (
         'CONFLUENT SCHEMA REGISTRY' url with_options? |
@@ -298,6 +252,12 @@ func_substring ::=
   'substring' '(' str ',' start_pos (',' len)? ')'
 func_timezone ::=
     'TIMEZONE' '(' zone'::'type ',' ( 'timestamp' | 'timestamptz' ) ')'
+func_justify_days ::=
+  'justify_days' '(' interval ')'
+func_justify_hours ::=
+  'justify_hours' '(' interval ')'
+func_justify_interval ::=
+  'justify_interval' '(' interval ')'
 join_expr ::=
     select_pred ('CROSS' | 'NATURAL' join_type?) 'JOIN' table_ref select_post
 	| select_pred join_type 'JOIN' table_ref ( 'USING' '(' ( ( col_ref ) ( ( ',' col_ref ) )* ) ')' | 'ON' expression ) select_post

@@ -23,18 +23,25 @@ use mz_dataflow_types::{
     sources::{UpsertEnvelope, UpsertStyle},
     DataflowError, DecodeError, LinearOperator, SourceError, SourceErrorDetails,
 };
-use mz_expr::{EvalError, MirScalarExpr};
+use mz_expr::{EvalError, MirScalarExpr, SourceInstanceId};
 use mz_ore::result::ResultExt;
 use mz_persist::operators::upsert::{PersistentUpsert, PersistentUpsertConfig};
 use mz_repr::{Datum, Diff, Row, RowArena, Timestamp};
 use tracing::error;
 
 use crate::operator::StreamExt;
-use crate::source::{DecodeResult, SourceData};
+use crate::source::DecodeResult;
 
 #[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 struct UpsertSourceData {
-    raw_data: SourceData,
+    /// The actual value
+    value: Option<Result<Row, DataflowError>>,
+    /// The source's reported position for this record
+    position: i64,
+    /// The time that the upstream source believes that the message was created
+    /// Currently only applies to Kafka
+    upstream_time_millis: Option<i64>,
+    /// Metadata for this row
     metadata: Row,
 }
 
@@ -50,6 +57,7 @@ struct UpsertSourceData {
 /// is the responsibility of the caller to ensure that the collection is sealed up.
 pub(crate) fn upsert<G>(
     source_name: &str,
+    source_id: SourceInstanceId,
     stream: &Stream<G, DecodeResult>,
     as_of_frontier: Antichain<Timestamp>,
     operators: &mut Option<LinearOperator>,
@@ -167,7 +175,7 @@ where
             //
             // This also means that we cannot push MFPs into the upsert operatot, as that would
             // mean persisting EvalErrors, which, also icky.
-            let mut row_packer = mz_repr::Row::default();
+            let mut row_buf = Row::default();
             let stream = stream.flat_map(move |decode_result| {
                 if decode_result.key.is_none() {
                     // This is the same behaviour as regular upsert. It's not pretty, though.
@@ -178,17 +186,17 @@ where
 
                 // Fold metadata into the value if there is in fact a valid value.
                 let value = if let Some(Ok(value)) = decode_result.value {
-                    row_packer.clear();
+                    let mut row_packer = row_buf.packer();
                     row_packer.extend(value.iter());
                     row_packer.extend(decode_result.metadata.iter());
-                    Some(Ok(row_packer.finish_and_reuse()))
+                    Some(Ok(row_buf.clone()))
                 } else {
                     decode_result.value
                 };
                 Some((decode_result.key.unwrap(), value, offset))
             });
 
-            let mut row_packer = mz_repr::Row::default();
+            let mut row_buf = Row::default();
 
             let (upsert_output, upsert_persist_errs) =
                 stream.persistent_upsert(source_name, as_of_frontier, upsert_persist_config);
@@ -204,7 +212,7 @@ where
                                 let mut datums = Vec::with_capacity(source_arity);
                                 datums.extend(key.iter());
                                 datums.extend(value.iter());
-                                evaluate(&datums, &predicates, &position_or, &mut row_packer)
+                                evaluate(&datums, &predicates, &position_or, &mut row_buf)
                                     .map_err(DataflowError::from)
                             })
                             .transpose();
@@ -223,10 +231,9 @@ where
             // should be treating differently. We do not, however, at the current time have to
             // infrastructure for treating these errors differently, so we're adding them to the
             // same error collections.
-            let source_name = source_name.to_owned();
             let upsert_persist_errs = upsert_persist_errs.map(move |(err, ts, diff)| {
                 let source_error =
-                    SourceError::new(source_name.clone(), SourceErrorDetails::Persistence(err));
+                    SourceError::new(source_id, SourceErrorDetails::Persistence(err));
                 (source_error.into(), ts, diff)
             });
 
@@ -270,7 +277,7 @@ fn evaluate(
     datums: &[Datum],
     predicates: &[MirScalarExpr],
     position_or: &[Option<usize>],
-    row_packer: &mut mz_repr::Row,
+    row_buf: &mut Row,
 ) -> Result<Option<Row>, EvalError> {
     let arena = RowArena::new();
     // Each predicate is tested in order.
@@ -282,12 +289,12 @@ fn evaluate(
 
     // We pack dummy values in locations that do not reference
     // specific columns.
-    row_packer.clear();
+    let mut row_packer = row_buf.packer();
     row_packer.extend(position_or.iter().map(|x| match x {
         Some(column) => datums[*column],
         None => Datum::Dummy,
     }));
-    Ok(Some(row_packer.finish_and_reuse()))
+    Ok(Some(row_buf.clone()))
 }
 
 /// Internal core upsert logic.
@@ -344,32 +351,28 @@ where
                             .entry(time)
                             .or_insert_with(|| (cap.delayed(&time), HashMap::new()))
                             .1
-                            .entry(key)
-                            .or_insert_with(Default::default);
+                            .entry(key);
 
                         let new_entry = UpsertSourceData {
-                            raw_data: SourceData {
-                                value: new_value.map(ResultExt::err_into),
-                                position: new_position,
-                                // upsert sources don't have a column for this, so setting it to
-                                // `None` is fine.
-                                upstream_time_millis: None,
-                            },
+                            value: new_value.map(ResultExt::err_into),
+                            position: new_position,
+                            // upsert sources don't have a column for this, so setting it to
+                            // `None` is fine.
+                            upstream_time_millis: None,
                             metadata,
                         };
 
-                        if let Some(offset) = entry.raw_data.position {
-                            // If the time is equal, toss out the row with the
-                            // lower offset
-                            if offset < new_position.expect("Kafka must always have an offset") {
-                                *entry = new_entry;
+                        match entry {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                // If the time is equal, toss out the row with the
+                                // lower offset
+                                if e.get().position < new_position {
+                                    e.insert(new_entry);
+                                }
                             }
-                        } else {
-                            // If there was not a previous entry, we'll have
-                            // inserted a blank default value, and the
-                            // offset would be none.
-                            // Just insert new entry into the hashmap.
-                            *entry = new_entry;
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(new_entry);
+                            }
                         }
                     }
                 });
@@ -388,7 +391,7 @@ where
                             // we could produce and then remove the error from the output).
                             match key {
                                 Some(Ok(decoded_key)) => {
-                                    let decoded_value = match data.raw_data.value {
+                                    let decoded_value = match data.value {
                                         None => Ok(None),
                                         Some(value) => match value {
                                             Ok(row) => {
@@ -516,8 +519,8 @@ where
 
 /// `thin` uses information from the source description to find which indexes in the row
 /// are keys and skip them.
-fn thin(key_indices: &[usize], value: &Row, row_packer: &mut Row) -> Row {
-    row_packer.clear();
+fn thin(key_indices: &[usize], value: &Row, row_buf: &mut Row) -> Row {
+    let mut row_packer = row_buf.packer();
     let values = &mut value.iter();
     let mut next_idx = 0;
     for &key_idx in key_indices {
@@ -530,13 +533,13 @@ fn thin(key_indices: &[usize], value: &Row, row_packer: &mut Row) -> Row {
     // Finally, push any columns after the last key index
     row_packer.extend(values);
 
-    row_packer.finish_and_reuse()
+    row_buf.clone()
 }
 
 /// `rehydrate` uses information from the source description to find which indexes in the row
 /// are keys and add them back in in the right places.
-fn rehydrate(key_indices: &[usize], key: &Row, thinned_value: &Row, row_packer: &mut Row) -> Row {
-    row_packer.clear();
+fn rehydrate(key_indices: &[usize], key: &Row, thinned_value: &Row, row_buf: &mut Row) -> Row {
+    let mut row_packer = row_buf.packer();
     let values = &mut thinned_value.iter();
     let mut next_idx = 0;
     for (&key_idx, key_datum) in key_indices.iter().zip(key.iter()) {
@@ -549,7 +552,7 @@ fn rehydrate(key_indices: &[usize], key: &Row, thinned_value: &Row, row_packer: 
     // Finally, push any columns after the last key index
     row_packer.extend(values);
 
-    row_packer.finish_and_reuse()
+    row_buf.clone()
 }
 
 #[cfg(test)]

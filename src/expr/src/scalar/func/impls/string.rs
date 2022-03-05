@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,11 +21,12 @@ use mz_ore::result::ResultExt;
 use mz_repr::adt::char::{format_str_trim, Char, CharLength};
 use mz_repr::adt::interval::Interval;
 use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
+use mz_repr::adt::system::Oid;
 use mz_repr::adt::varchar::{VarChar, VarCharMaxLength};
 use mz_repr::{strconv, ColumnType, Datum, RowArena, ScalarType};
 
 use crate::scalar::func::{array_create_scalar, EagerUnaryFunc, LazyUnaryFunc};
-use crate::{EvalError, MirScalarExpr};
+use crate::{EvalError, MirScalarExpr, UnaryFunc};
 
 sqlfunc!(
     #[sqlname = "strtobool"]
@@ -73,6 +75,13 @@ sqlfunc!(
     #[sqlname = "strtof64"]
     fn cast_string_to_float64<'a>(a: &'a str) -> Result<f64, EvalError> {
         strconv::parse_float64(a).err_into()
+    }
+);
+
+sqlfunc!(
+    #[sqlname = "strtooid"]
+    fn cast_string_to_oid<'a>(a: &'a str) -> Result<Oid, EvalError> {
+        Ok(Oid(strconv::parse_oid(a)?))
     }
 );
 
@@ -250,7 +259,7 @@ impl LazyUnaryFunc for CastStringToList {
 
     /// The output ColumnType of this function
     fn output_type(&self, _input_type: ColumnType) -> ColumnType {
-        self.return_ty.default_embedded_value().nullable(false)
+        self.return_ty.without_modifiers().nullable(false)
     }
 
     /// Whether this function will produce NULL on NULL input
@@ -420,5 +429,66 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToVarChar {
 impl fmt::Display for CastStringToVarChar {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("strtovarchar")
+    }
+}
+
+// If we support another vector type, this should likely get hoisted into a
+// position akin to array parsing.
+lazy_static! {
+    static ref INT2VECTOR_CAST_EXPR: MirScalarExpr = MirScalarExpr::CallUnary {
+        func: UnaryFunc::CastStringToInt16(CastStringToInt16),
+        expr: Box::new(MirScalarExpr::Column(0)),
+    };
+}
+
+#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+pub struct CastStringToInt2Vector;
+
+impl LazyUnaryFunc for CastStringToInt2Vector {
+    fn eval<'a>(
+        &'a self,
+        datums: &[Datum<'a>],
+        temp_storage: &'a RowArena,
+        a: &'a MirScalarExpr,
+    ) -> Result<Datum<'a>, EvalError> {
+        let a = a.eval(datums, temp_storage)?;
+        if a.is_null() {
+            return Ok(Datum::Null);
+        }
+
+        let datums = strconv::parse_legacy_vector(a.unwrap_str(), |elem_text| {
+            let elem_text = match elem_text {
+                Cow::Owned(s) => temp_storage.push_string(s),
+                Cow::Borrowed(s) => s,
+            };
+            INT2VECTOR_CAST_EXPR.eval(&[Datum::String(elem_text)], temp_storage)
+        })?;
+        array_create_scalar(&datums, temp_storage)
+    }
+
+    /// The output ColumnType of this function
+    fn output_type(&self, _input_type: ColumnType) -> ColumnType {
+        ScalarType::Int2Vector.nullable(false)
+    }
+
+    /// Whether this function will produce NULL on NULL input
+    fn propagates_nulls(&self) -> bool {
+        true
+    }
+
+    /// Whether this function will produce NULL on non-NULL input
+    fn introduces_nulls(&self) -> bool {
+        false
+    }
+
+    /// Whether this function preserves uniqueness
+    fn preserves_uniqueness(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Display for CastStringToInt2Vector {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("strtoint2vector")
     }
 }

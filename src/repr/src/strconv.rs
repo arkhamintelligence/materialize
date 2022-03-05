@@ -154,6 +154,29 @@ where
     Nestable::Yes
 }
 
+/// Writes an OID to `buf`.
+pub fn format_oid<F>(buf: &mut F, oid: u32) -> Nestable
+where
+    F: FormatBuffer,
+{
+    write!(buf, "{}", oid);
+    Nestable::Yes
+}
+
+/// Parses an OID from `s`.
+pub fn parse_oid(s: &str) -> Result<u32, ParseError> {
+    // For historical reasons in PostgreSQL, OIDs are parsed as `i32`s and then
+    // reinterpreted as `u32`s.
+    //
+    // Do not use this as a model for behavior in other contexts. OIDs should
+    // not in general be thought of as freely convertible from `i32`s.
+    let oid: i32 = s
+        .trim()
+        .parse()
+        .map_err(|e| ParseError::invalid_input_syntax("oid", s).with_details(e))?;
+    Ok(u32::from_ne_bytes(oid.to_ne_bytes()))
+}
+
 fn parse_float<Fl>(type_name: &'static str, s: &str) -> Result<Fl, ParseError>
 where
     Fl: NumFloat + FastFloat,
@@ -802,6 +825,43 @@ where
     Ok(elems)
 }
 
+pub fn parse_legacy_vector<'a, T, E>(
+    s: &'a str,
+    gen_elem: impl FnMut(Cow<'a, str>) -> Result<T, E>,
+) -> Result<Vec<T>, ParseError>
+where
+    E: fmt::Display,
+{
+    parse_legacy_vector_inner(s, gen_elem)
+        .map_err(|details| ParseError::invalid_input_syntax("int2vector", s).with_details(details))
+}
+
+pub fn parse_legacy_vector_inner<'a, T, E>(
+    s: &'a str,
+    mut gen_elem: impl FnMut(Cow<'a, str>) -> Result<T, E>,
+) -> Result<Vec<T>, String>
+where
+    E: fmt::Display,
+{
+    let mut elems = vec![];
+    let buf = &mut LexBuf::new(s);
+
+    let mut gen = |elem| gen_elem(elem).map_err_to_string();
+
+    loop {
+        buf.take_while(|ch| ch.is_ascii_whitespace());
+        match buf.peek() {
+            Some(_) => {
+                let elem = buf.take_while(|ch| !ch.is_ascii_whitespace());
+                elems.push(gen(elem.into())?);
+            }
+            None => break,
+        }
+    }
+
+    Ok(elems)
+}
+
 fn lex_quoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, String> {
     assert!(buf.consume('"'));
     let s = buf.take_while(|ch| !matches!(ch, '"' | '\\'));
@@ -1093,15 +1153,41 @@ pub fn format_array_inner<F, T>(
     buf.write_char('}');
 }
 
+pub fn format_legacy_vector<F, T>(
+    buf: &mut F,
+    elems: impl IntoIterator<Item = T>,
+    format_elem: impl FnMut(ListElementWriter<F>, T) -> Nestable,
+) -> Nestable
+where
+    F: FormatBuffer,
+{
+    format_elems(buf, elems, format_elem, ' ');
+    Nestable::MayNeedEscaping
+}
+
 pub fn format_list<F, T>(
     buf: &mut F,
     elems: impl IntoIterator<Item = T>,
-    mut format_elem: impl FnMut(ListElementWriter<F>, T) -> Nestable,
+    format_elem: impl FnMut(ListElementWriter<F>, T) -> Nestable,
 ) -> Nestable
 where
     F: FormatBuffer,
 {
     buf.write_char('{');
+    format_elems(buf, elems, format_elem, ',');
+    buf.write_char('}');
+    Nestable::Yes
+}
+
+/// Writes each `elem` into `buf`, separating the elems with `sep`.
+pub fn format_elems<F, T>(
+    buf: &mut F,
+    elems: impl IntoIterator<Item = T>,
+    mut format_elem: impl FnMut(ListElementWriter<F>, T) -> Nestable,
+    sep: char,
+) where
+    F: FormatBuffer,
+{
     let mut elems = elems.into_iter().peekable();
     while let Some(elem) = elems.next() {
         let start = buf.len();
@@ -1109,11 +1195,9 @@ where
             escape_elem::<_, ListElementEscaper>(buf, start);
         }
         if elems.peek().is_some() {
-            buf.write_char(',')
+            buf.write_char(sep)
         }
     }
-    buf.write_char('}');
-    Nestable::Yes
 }
 
 pub trait ElementEscaper {

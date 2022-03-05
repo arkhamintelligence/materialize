@@ -14,165 +14,57 @@ This page details changes between versions of Materialize, including:
 For information about available versions, see our [Versions page](/versions).
 
 {{< comment >}}
-# What changes require a release note?
-
-Any behavior change to a stable, user-visible API requires a release note.
-Roughly speaking, Materialize's stable APIs are:
-
-  * The syntax and semantics of all documented SQL statements.
-  * The observable behavior of any source or sink.
-  * The behavior of all documented command-line flags.
-
-For details, see the [backwards compatibility policy](/versions/#Backwards-compatibility).
-
-Notably, changes to experimental or unstable APIs should *not* have release
-notes. The point of having experimental and unstable APIs is to decrease the
-engineering burden when those features are changed. Instead, write a release
-note introducing the feature for the release in which the feature is
-de-experimentalized.
-
-Examples of changes that require release notes:
-
-  * The addition of a new, documented SQL function.
-  * The stabilization of a new source type.
-  * A bug fix that fixes a panic in any component.
-  * A bug fix that changes the output format of a particular data type in a
-    sink.
-
-Examples of changes that do not require release notes:
-
-  * **An improvement to the build system.** The build system is not user
-    visible.
-  * **The addition of a feature to testdrive.** Similarly, our test frameworks
-    are not user visible.
-  * **An upgrade of an internal Rust dependency.** Most dependency upgrades
-    do not result in user-visible changes. (If they do, document the change
-    itself, not the fact that the dependency was upgraded. Users care about
-    the visible behavior of Materialize, not its implementation!)
-
-Performance improvements are a borderline case. A small performance improvement
-does not need a release note, but a large performance improvement may warrant
-one if it results in a noticeable improvement for a large class of users or
-unlocks new use cases for Materialize. Examples of performance improvements
-that warrant a release note include:
-
-  * Improving the speed of Avro decoding by 2x
-  * Converting an O(n<sup>2</sup>) algorithm in the optimizer to an O(n)
-    algorithm so that queries with several dozen `UNION` operations can be
-    planned in a reasonable amount of time
-
-# How to write a good release note
-
-Every release note should be phrased in the imperative mood, like a Git
-commit message. They should complete the sentence, "This release will...".
-
-Good release notes:
-
-  - [This release will...] Require the `-w` / `--workers` command-line option.
-  - [This release will...] In the event of a crash, print the stack trace.
-
-Misbehaved release notes:
-
-  - Users must now specify the `-w` / `-threads` command line option.
-  - Materialize will print a stack trace if it crashes.
-  - Instead of limiting SQL statements to 8KiB, limit them to 1024KiB instead.
-
-Link to at least one page where users can learn more about either the change or
-the area which the change was made. Notes about new features can be concise if
-the new feature has comprehensive documentation. Notes about changes to features
-must be more detailed, as the note is likely the only documentation of the
-change in behavior. Consider linking to a GitHub issue or pull request via the
-`gh` shortcode if there is no good section of the documentation to link to.
-
-Strive for some variety of verbs. "Support new feature" gets boring as a release
-note.
-
-Use relative links (/path/to/doc), not absolute links
-(https://materialize.com/docs/path/to/doc).
-
-Wrap your release notes at the 80 character mark.
-
-## Internal note order
-
-Put breaking changes before other release notes, and mark them with
-`**Breaking change.**` at the start.
-
-List new features before bug fixes.
-
+ATTENTION: Don't add new release notes here! Add them in the designated spot in
+the PR description instead. They will be migrated here during the release
+process by the release notes team.
 {{< /comment >}}
-
-## Unstable
-
-These changes are present in [unstable builds](/versions/#unstable-builds) and
-are slated for inclusion in the next stable release. There may be additional
-changes that have not yet been documented.
-
-- **Breaking change.** Return an empty list for slice operations that retrieve
-  no elements (e.g. the beginning of the slice's range exceeds the length of the
-  list); previously Materialize returned NULL.
-
-- **Breaking change.** Decrease minimum [`interval`](/sql/types/interval) value
-  from '-2147483647 months -2147483647 days -2147483647 hours -59 minutes
-  -59.999999 seconds' to '-2147483648 months -2147483648 days -2147483648 hours
-  -59 minutes -59.999999 seconds' to match PostgreSQL's behavior {{% gh 10598 %}}.
-
-- Fix a bug where too many columns were returned when both `*` and a
-  table function appeared in the `SELECT` list {{% gh 10363 %}}.
-
-- Improve the clarity of any Avro schema resolution errors found when
-  creating materialized sources and views. {{% gh 8415 %}}
-
-- Allow setting `standard_conforming_strings` to its default value of `on`.
-  Setting it to `off` is still not supported.
-
-- Support sequences of subscript operations on [`array`] values when
-  indexing/accessing individual elements (as opposed to taking slices/ranges of
-  values) {{% gh 9815 %}}.
-
-- Allow setting `client_min_messages` to support filtering which messages are
-  sent to the client based on the severity level.
-
-- Add support for `ESCAPE` clauses in `LIKE` and `ILIKE` expressions.
-
-- Add support for `ARRAY(<subquery>)` constructor {{% gh 10700 %}}.
-
-- `INCLUDE KEY AS` ([see this for more details](/sql/create-source/kafka#exposing-source-metadata)
-  now works when using `ENVELOPE UPSERT`
-  {{% gh 10730 %}}.
-
-- Change inclusive ranges of column indices in `EXPLAIN PLAN` to use `..=` instead of `..`.
-
-- Add [`chr`](/sql/functions#string-func) function to convert a Unicode codepoint
-  into a string.
-
-{{< comment >}}
-Only add new release notes above this line.
-
-The presence of this comment ensures that PRs that are alive across a release
-boundary don't silently merge their release notes into the wrong place.
-{{</ comment >}}
 
 {{% version-header v0.21.0 %}}
 
-- **Breaking change.** Return an empty list for slice operations that yield
-  no elements (e.g., the beginning of the slice's range exceeds the length of the
-  list); previously these operations returned `NULL` {{% gh 10557 %}}.
+- **Breaking change.** Return an empty list for slice operations that yield no
+  elements (e.g., when the beginning of the slice's range exceeds the length of
+  the list); previously these operations returned `NULL` {{% gh 10557 %}}.
 
-- **Breaking change.** Decrease the minimum [`interval`](/sql/types/interval)
-  value from `-2147483647 months -2147483647 days -2147483647 hours -59 minutes
-  -59.999999 seconds` to `-2147483648 months -2147483648 days -2147483648 hours
-  -59 minutes -59.999999 seconds` to match PostgreSQL {{% gh 10598 %}}.
+- **Breaking change.** Decrease the minimum [`interval`] value from `-2147483647
+  months -2147483647 days -2147483647 hours -59 minutes -59.999999 seconds` to
+  `-2147483648 months -2147483648 days -2147483648 hours -59 minutes -59.999999
+  seconds` to match PostgreSQL {{% gh 10598 %}}.
+
+- Support sequences of subscript operations on [`array`] values when
+  indexing/accessing individual elements (as opposed to slicing/accessing ranges
+  of elements) {{% gh 9815 %}}.
 
 - Allow setting the `standard_conforming_strings` session parameter to its
   default value of `on` {{% gh 10691 %}}. Setting it to `off` remains
   unsupported.
 
+- Allow setting the `client_min_messages` session parameter, which controls
+  which messages are sent to the client based on the severity level
+  {{% gh 10693 %}}.
+
+- Improve the clarity of schema resolution errors generated by Avro-formatted
+  sources {{% gh 8415 %}}.
+
+- Add the [`chr`](/sql/functions#string-func) function to convert a Unicode
+  codepoint into a string.
+
+- Change inclusive ranges of column indices in the plans generated by
+  [`EXPLAIN`](/sql/explain) to use `..=` instead of `..`.
+
+- Support the `ARRAY(<subquery>)` expression for constructing an [`array`]
+  from the result of a subquery {{% gh 10700 %}}.
+
+- In Kafka sources that use `ENVELOPE UPSERT`, fix renaming the key column via
+  [`INCLUDE KEY AS`](/sql/create-source/kafka#key) {{% gh 10730 %}}.
+
 - Return the correct number of columns when both a wildcard (`*`) and a [table
   function](/sql/functions#table-func) appear in the `SELECT` list
   {{% gh 10363 %}}.
 
-- Improve the clarity of schema resolution errors generated by Avro-formatted
-  sources {{% gh 8415 %}}.
+- Avoid panicking when negating certain intervals {{% gh 10729 %}}.
+
+- Fix an issue in Avro-formatted sources where an invalid record could corrupt
+  the next record, yielding either wrong results or a panic {{% gh 10767 %}}.
 
 {{% version-header v0.20.0 %}}
 
@@ -209,7 +101,7 @@ boundary don't silently merge their release notes into the wrong place.
   type names when possible, rather than PostgreSQL-specific type names.
 
 - Support assuming AWS roles in S3 and Kinesis sources {{% gh 5895 %}}. See
-  [Specifying AWS credentials](/sql/create-source/text-s3/#specifying-aws-credentials)
+  [Specifying AWS credentials](/sql/create-source/kinesis/#aws-credentials)
   for details.
 
 - Support arbitrary `SELECT` statements in [`TAIL`](/sql/tail).
@@ -228,12 +120,11 @@ boundary don't silently merge their release notes into the wrong place.
 - Add the [cryptography functions](/sql/functions/#cryptography-func) `md5`,
   `sha224`, `sha256`, `sha384`, and `sha512`.
 
-- Add `microsecond`, `month`, `decade`, `century`, `millennium` units
-  to [`interval`](/sql/types/interval) parsing using the PostgreSQL verbose
-  format.
+- Add `microsecond`, `month`, `decade`, `century`, `millennium` units to
+  [`interval`] parsing using the PostgreSQL verbose format.
 
-- Improve millisecond parsing for [`interval`](/sql/types/interval) using the
-  PostgreSQL verbose format {{% gh 6420 %}}.
+- Improve millisecond parsing for [`interval`] using the PostgreSQL verbose
+  format {{% gh 6420 %}}.
 
 - Support casting [`array`] types to [`list`] types.
 
@@ -577,10 +468,10 @@ Improve PostgreSQL compatibility:
 - Speed up the creation or restart of a [Kafka sink](/sql/create-sink/)
   that uses the `reuse_topic` option {{% gh 9094 %}}.
 
-- Accept message names in [Protobuf sources] that do not start with a leading
+- Accept message names in Protobuf sources that do not start with a leading
   dot {{% gh 9372 %}}. This fixes a regression introduced in v0.9.12.
 
-- Fix decoding of [Protobuf sources] whose type contains a nested message type
+- Fix decoding of Protobuf sources whose type contains a nested message type
   with one or more integer fields {{% gh 8930 %}}. These messages could
   cause previous versions of Materialize to crash.
 
@@ -645,7 +536,7 @@ Improve PostgreSQL compatibility:
 
 {{% version-header v0.9.12 %}}
 
-- **Known issue.** Message names in [Protobuf sources] that do not start with a
+- **Known issue.** Message names in Protobuf sources that do not start with a
   leading dot are erroneously rejected. As a workaround, add a leading dot to
   the message name. This regression is corrected in v0.11.0.
 
@@ -851,7 +742,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 {{% version-header v0.9.0 %}}
 
-- **Breaking change.** Reject [Protobuf sources] whose schemas contain
+- **Breaking change.** Reject Protobuf sources whose schemas contain
   unsigned integer types (`uint32`, `uint64`, `fixed32`, and `fixed64`).
   Materialize previously converted these types to
   [`numeric`](/sql/types/numeric).
@@ -1226,15 +1117,14 @@ a problem with PostgreSQL JDBC 42.3.0.
 
   - Allow specifying units of `microseconds`, `milliseconds`, `month`,
     `quarter`, `decade`, `century`, or `millenium` when applying the `EXTRACT`
-    function to an [`interval`](/sql/types/interval) {{% gh 5107 %}}. Previously
-    these units were only supported with the [`timestamp`](/sql/types/timestamp)
-    and [`timestamptz`](/sql/types/timestamptz) types.
+    function to an [`interval`] {{% gh 5107 %}}. Previously these units were
+    only supported with the [`timestamp`](/sql/types/timestamp) and
+    [`timestamptz`](/sql/types/timestamptz) types.
 
     Thanks again to external contributor
     [@zRedShift](https://github.com/zRedShift).
 
-  - Support multiplying and dividing [`interval`](/sql/types/interval)s by
-    numbers {{% gh 5107 %}}.
+  - Support multiplying and dividing [`interval`]s by numbers {{% gh 5107 %}}.
 
     Thanks once more to external contributor
     [@zRedShift](https://github.com/zRedShift).
@@ -1841,7 +1731,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   other Debezium connectors (e.g., PostgreSQL).
 
 - Automatically refresh
-  [AWS credentials for Kinesis sources](/sql/create-source/json-kinesis/#with-options)
+  [AWS credentials for Kinesis sources](/sql/create-source/kinesis/#aws-credentials)
   when credentials are sourced from an IAM instance or container profile
   {{% gh 2928 %}}.
 
@@ -1942,7 +1832,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   - [SHOW COLUMNS](/sql/show-index)
 
 - Support reading from Kinesis streams with multiple shards. For details, about
-  Kinesis sources, see [CREATE SOURCE: JSON over Kinesis](/sql/create-source/json-kinesis).
+  Kinesis sources, see [CREATE SOURCE: Kinesis Data Streams](/sql/create-source/kinesis).
 
 {{% version-header v0.2.0 %}}
 
@@ -1991,7 +1881,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 {{% version-header v0.1.3 %}}
 
-- Support [Amazon Kinesis Data Stream sources](/sql/create-source/json-kinesis/).
+- Support [Amazon Kinesis Data Streams sources](/sql/create-source/kinesis).
 
 - Support the number functions `round(x: N)` and `round(x: N, y: N)`, which
   round `x` to the `y`th digit after the decimal. (Default 0).
@@ -2072,4 +1962,3 @@ a problem with PostgreSQL JDBC 42.3.0.
 [pgwire-simple]: https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
 [pgwire-extended]: https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 [PgJDBC]: https://jdbc.postgresql.org
-[Protobuf sources]: /sql/create-source/protobuf-kinesis/#protobuf-format-details

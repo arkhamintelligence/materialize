@@ -322,6 +322,27 @@ impl ErrorResponse {
         ErrorResponse::new(Severity::Warning, code, message)
     }
 
+    pub fn info<S>(code: SqlState, message: S) -> ErrorResponse
+    where
+        S: Into<String>,
+    {
+        ErrorResponse::new(Severity::Info, code, message)
+    }
+
+    pub fn log<S>(code: SqlState, message: S) -> ErrorResponse
+    where
+        S: Into<String>,
+    {
+        ErrorResponse::new(Severity::Log, code, message)
+    }
+
+    pub fn debug<S>(code: SqlState, message: S) -> ErrorResponse
+    where
+        S: Into<String>,
+    {
+        ErrorResponse::new(Severity::Debug, code, message)
+    }
+
     fn new<S>(severity: Severity, code: SqlState, message: S) -> ErrorResponse
     where
         S: Into<String>,
@@ -381,9 +402,10 @@ impl ErrorResponse {
             CoordError::TailOnlyTransaction => SqlState::INVALID_TRANSACTION_STATE,
             CoordError::Transform(_) => SqlState::INTERNAL_ERROR,
             CoordError::UnknownCursor(_) => SqlState::INVALID_CURSOR_NAME,
-            CoordError::UnknownParameter(_) => SqlState::INVALID_SQL_STATEMENT_NAME,
+            CoordError::UnknownParameter(_) => SqlState::UNDEFINED_OBJECT,
             CoordError::UnknownPreparedStatement(_) => SqlState::UNDEFINED_PSTATEMENT,
             CoordError::UnknownLoginRole(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+            CoordError::UnmaterializableFunction(_) => SqlState::FEATURE_NOT_SUPPORTED,
             CoordError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             CoordError::Unstructured(_) => SqlState::INTERNAL_ERROR,
             // It's not immediately clear which error code to use here because a

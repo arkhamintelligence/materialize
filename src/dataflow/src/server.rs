@@ -9,7 +9,10 @@
 
 //! An interactive dataflow server.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -17,7 +20,6 @@ use anyhow::anyhow;
 use crossbeam_channel::TryRecvError;
 use differential_dataflow::trace::cursor::Cursor;
 use differential_dataflow::trace::TraceReader;
-use mz_dataflow_types::sources::AwsExternalId;
 use timely::communication::initialize::WorkerGuards;
 use timely::communication::Allocate;
 use timely::dataflow::operators::unordered_input::UnorderedHandle;
@@ -27,7 +29,9 @@ use timely::progress::frontier::Antichain;
 use timely::worker::Worker as TimelyWorker;
 use tokio::sync::mpsc;
 
-use mz_dataflow_types::client::{Command, LocalClient, Response};
+use mz_dataflow_types::client::ComputeInstanceId;
+use mz_dataflow_types::client::{Command, ComputeCommand, LocalClient, Response};
+use mz_dataflow_types::sources::AwsExternalId;
 use mz_dataflow_types::PeekResponse;
 use mz_expr::{GlobalId, RowSetFinishing};
 use mz_ore::metrics::MetricsRegistry;
@@ -47,7 +51,9 @@ pub mod boundary;
 mod compute_state;
 mod metrics;
 mod storage_state;
+pub mod tcp_boundary;
 
+use crate::server::boundary::EventLinkBoundary;
 use boundary::{ComputeReplay, StorageCapture};
 use compute_state::ActiveComputeState;
 pub(crate) use compute_state::ComputeState;
@@ -80,12 +86,41 @@ pub struct Server {
 }
 
 /// Initiates a timely dataflow computation, processing materialized commands.
+///
+/// It uses the default [EventLinkBoundary] to host both compute and storage dataflows.
 pub fn serve(config: Config) -> Result<(Server, LocalClient), anyhow::Error> {
+    serve_boundary(config, |_| {
+        let boundary = Rc::new(RefCell::new(EventLinkBoundary::new()));
+        (Rc::clone(&boundary), boundary)
+    })
+}
+
+/// Initiates a timely dataflow computation, processing materialized commands.
+///
+/// * `create_boundary`: A function to obtain the worker-local boundary components.
+pub fn serve_boundary<
+    SC: StorageCapture,
+    CR: ComputeReplay,
+    B: Fn(usize) -> (SC, CR) + Send + Sync + 'static,
+>(
+    config: Config,
+    create_boundary: B,
+) -> Result<(Server, LocalClient), anyhow::Error> {
     assert!(config.workers > 0);
 
+    // Various metrics related things.
     let server_metrics = ServerMetrics::register_with(&config.metrics_registry);
     let source_metrics = SourceBaseMetrics::register_with(&config.metrics_registry);
     let sink_metrics = SinkBaseMetrics::register_with(&config.metrics_registry);
+    let unspecified_metrics = Metrics::register_with(&config.metrics_registry);
+    let trace_metrics = TraceMetrics::register_with(&config.metrics_registry);
+    // Bundle metrics to conceal complexity.
+    let metrics_bundle = (
+        source_metrics,
+        sink_metrics,
+        unspecified_metrics,
+        trace_metrics,
+    );
 
     // Construct endpoints for each thread that will receive the coordinator's
     // sequenced command stream and send the responses to the coordinator.
@@ -110,43 +145,33 @@ pub fn serve(config: Config) -> Result<(Server, LocalClient), anyhow::Error> {
 
     let tokio_executor = tokio::runtime::Handle::current();
     let now = config.now;
-    let metrics = Metrics::register_with(&config.metrics_registry);
-    let trace_metrics = TraceMetrics::register_with(&config.metrics_registry);
     let aws_external_id = config.aws_external_id.clone();
+
     let worker_guards = timely::execute::execute(config.timely_config, move |timely_worker| {
+        let timely_worker_index = timely_worker.index();
+        let timely_worker_peers = timely_worker.peers();
+        let (storage_boundary, compute_boundary) = create_boundary(timely_worker_index);
         let _tokio_guard = tokio_executor.enter();
         let (response_tx, command_rx) = channels.lock().unwrap()
-            [timely_worker.index() % config.workers]
+            [timely_worker_index % config.workers]
             .take()
             .unwrap();
         let worker_idx = timely_worker.index();
-        let metrics = metrics.clone();
-        let trace_metrics = trace_metrics.clone();
-        let source_metrics = source_metrics.clone();
-        let sink_metrics = sink_metrics.clone();
-        let timely_worker_index = timely_worker.index();
-        let timely_worker_peers = timely_worker.peers();
+        let (source_metrics, _sink_metrics, unspecified_metrics, _trace_metrics) =
+            metrics_bundle.clone();
         Worker {
             timely_worker,
-            compute_state: ComputeState {
-                traces: TraceManager::new(trace_metrics, worker_idx),
-                dataflow_tokens: HashMap::new(),
-                tail_response_buffer: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-                sink_write_frontiers: HashMap::new(),
-                pending_peeks: Vec::new(),
-                reported_frontiers: HashMap::new(),
-                sink_metrics,
-                materialized_logger: None,
-            },
+            compute_state: BTreeMap::default(),
             storage_state: StorageState {
                 local_inputs: HashMap::new(),
                 source_descriptions: HashMap::new(),
+                source_uppers: HashMap::new(),
                 ts_source_mapping: HashMap::new(),
                 ts_histories: HashMap::default(),
                 persisted_sources: PersistedSourceManager::new(),
-                metrics,
+                unspecified_metrics,
                 persist: config.persister.clone(),
-                reported_bindings_frontiers: HashMap::new(),
+                reported_frontiers: HashMap::new(),
                 last_bindings_feedback: Instant::now(),
                 now: now.clone(),
                 source_metrics,
@@ -154,10 +179,14 @@ pub fn serve(config: Config) -> Result<(Server, LocalClient), anyhow::Error> {
                 timely_worker_index,
                 timely_worker_peers,
             },
-            boundary: boundary::EventLinkBoundary::new(),
+            storage_boundary,
+            compute_boundary,
             command_rx,
             response_tx,
-            command_metrics: server_metrics.for_worker_id(worker_idx),
+            metrics_bundle: (
+                server_metrics.for_worker_id(worker_idx),
+                metrics_bundle.clone(),
+            ),
         }
         .run()
     })
@@ -181,38 +210,53 @@ pub fn serve(config: Config) -> Result<(Server, LocalClient), anyhow::Error> {
 ///
 /// Much of this state can be viewed as local variables for the worker thread,
 /// holding state that persists across function calls.
-struct Worker<'w, A, B>
+struct Worker<'w, A, SC, CR>
 where
     A: Allocate,
-    B: StorageCapture + ComputeReplay,
+    SC: StorageCapture,
+    CR: ComputeReplay,
 {
     /// The underlying Timely worker.
     timely_worker: &'w mut TimelyWorker<A>,
     /// The state associated with rendering dataflows.
-    compute_state: ComputeState,
+    compute_state: BTreeMap<ComputeInstanceId, ComputeState>,
     /// The state associated with collection ingress and egress.
     storage_state: StorageState,
-    /// The boundary between storage and compute layers.
-    boundary: B,
+    /// The boundary between storage and compute layers, storage side.
+    storage_boundary: SC,
+    /// The boundary between storage and compute layers, compute side.
+    compute_boundary: CR,
     /// The channel from which commands are drawn.
     command_rx: crossbeam_channel::Receiver<Command>,
     /// The channel over which frontier information is reported.
     response_tx: mpsc::UnboundedSender<Response>,
     /// Metrics bundle.
-    command_metrics: WorkerMetrics,
+    metrics_bundle: (
+        WorkerMetrics,
+        (SourceBaseMetrics, SinkBaseMetrics, Metrics, TraceMetrics),
+    ),
 }
 
-impl<'w, A, B> Worker<'w, A, B>
+impl<'w, A, SC, CR> Worker<'w, A, SC, CR>
 where
     A: Allocate + 'w,
-    B: StorageCapture + ComputeReplay,
+    SC: StorageCapture,
+    CR: ComputeReplay,
 {
     /// Draws from `dataflow_command_receiver` until shutdown.
     fn run(&mut self) {
+        let mut compute_instances = Vec::new();
+
         let mut shutdown = false;
         while !shutdown {
             // Enable trace compaction.
-            self.compute_state.traces.maintenance();
+            for instance in compute_instances.iter() {
+                self.compute_state
+                    .get_mut(&instance)
+                    .unwrap()
+                    .traces
+                    .maintenance();
+            }
 
             // Ask Timely to execute a unit of work. If Timely decides there's
             // nothing to do, it will park the thread. We rely on another thread
@@ -221,9 +265,13 @@ where
             self.timely_worker.step_or_park(None);
 
             // Report frontier information back the coordinator.
-            self.activate_compute().report_compute_frontiers();
+            for instance_id in compute_instances.iter() {
+                self.activate_compute(*instance_id)
+                    .report_compute_frontiers();
+            }
             self.activate_storage().update_rt_timestamps();
-            self.activate_storage().report_timestamp_bindings();
+            self.activate_storage()
+                .report_conditional_frontier_progress();
 
             // Handle any received commands.
             let mut cmds = vec![];
@@ -238,42 +286,75 @@ where
                     }
                 }
             }
-            self.command_metrics.observe_command_queue(&cmds);
+            self.metrics_bundle.0.observe_command_queue(&cmds);
             for cmd in cmds {
-                self.command_metrics.observe_command(&cmd);
+                self.metrics_bundle.0.observe_command(&cmd);
+
+                if let Command::Compute(ComputeCommand::CreateInstance(_logging), instance_id) =
+                    &cmd
+                {
+                    let compute_instance = ComputeState {
+                        traces: TraceManager::new(
+                            (self.metrics_bundle.1).3.clone(),
+                            self.timely_worker.index(),
+                        ),
+                        dataflow_tokens: HashMap::new(),
+                        tail_response_buffer: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                        sink_write_frontiers: HashMap::new(),
+                        pending_peeks: Vec::new(),
+                        reported_frontiers: HashMap::new(),
+                        sink_metrics: (self.metrics_bundle.1).1.clone(),
+                        materialized_logger: None,
+                    };
+                    self.compute_state.insert(*instance_id, compute_instance);
+                    compute_instances.push(*instance_id);
+                }
+
                 self.handle_command(cmd);
             }
 
-            self.command_metrics
-                .observe_pending_peeks(&self.compute_state.pending_peeks);
-            self.command_metrics.observe_command_finish();
-            self.activate_compute().process_peeks();
-            self.activate_compute().process_tails();
+            self.metrics_bundle.0.observe_command_finish();
+            for instance_id in compute_instances.iter() {
+                self.metrics_bundle
+                    .0
+                    .observe_pending_peeks(&self.compute_state[instance_id].pending_peeks);
+                self.activate_compute(*instance_id).process_peeks();
+                self.activate_compute(*instance_id).process_tails();
+            }
         }
-        self.compute_state.traces.del_all_traces();
-        self.activate_compute().shutdown_logging();
+        for instance_id in compute_instances.iter() {
+            self.compute_state
+                .get_mut(instance_id)
+                .unwrap()
+                .traces
+                .del_all_traces();
+            self.activate_compute(*instance_id).shutdown_logging();
+        }
     }
 
-    fn activate_compute(&mut self) -> ActiveComputeState<A, B> {
+    fn activate_compute(&mut self, instance_id: ComputeInstanceId) -> ActiveComputeState<A, CR> {
         ActiveComputeState {
             timely_worker: &mut *self.timely_worker,
-            compute_state: &mut self.compute_state,
+            compute_state: self.compute_state.get_mut(&instance_id).unwrap(),
+            instance_id,
             response_tx: &mut self.response_tx,
-            boundary: &mut self.boundary,
+            boundary: &mut self.compute_boundary,
         }
     }
-    fn activate_storage(&mut self) -> ActiveStorageState<A, B> {
+    fn activate_storage(&mut self) -> ActiveStorageState<A, SC> {
         ActiveStorageState {
             timely_worker: &mut *self.timely_worker,
             storage_state: &mut self.storage_state,
             response_tx: &mut self.response_tx,
-            boundary: &mut self.boundary,
+            boundary: &mut self.storage_boundary,
         }
     }
 
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Compute(cmd, _instance) => self.activate_compute().handle_compute_command(cmd),
+            Command::Compute(cmd, instance) => {
+                self.activate_compute(instance).handle_compute_command(cmd)
+            }
             Command::Storage(cmd) => self.activate_storage().handle_storage_command(cmd),
         }
     }
@@ -341,7 +422,7 @@ impl PendingPeek {
     }
 
     /// Collects data for a known-complete peek.
-    fn collect_finished_data(&mut self) -> Result<Vec<Row>, String> {
+    fn collect_finished_data(&mut self) -> Result<Vec<(Row, NonZeroUsize)>, String> {
         // Check if there exist any errors and, if so, return whatever one we
         // find first.
         let (mut cursor, storage) = self.trace_bundle.errs_mut().cursor();
@@ -367,7 +448,7 @@ impl PendingPeek {
 
         // Cursor and bound lifetime for `Row` data in the backing trace.
         let (mut cursor, storage) = self.trace_bundle.oks_mut().cursor();
-        // Accumulated `Vec<Datum>` results that we are likely to return.
+        // Accumulated `Vec<(row, count)>` results that we are likely to return.
         let mut results = Vec::new();
 
         // When set, a bound on the number of records we need to return.
@@ -411,26 +492,18 @@ impl PendingPeek {
                             copies += diff;
                         }
                     });
-                    if copies < 0 {
+                    let copies: usize = if copies < 0 {
                         return Err(format!(
                             "Invalid data in source, saw retractions ({}) for row that does not exist: {:?}",
                             copies * -1,
                             &*borrow,
                         ));
-                    }
-
-                    // When we have a LIMIT we can restrict the number of copies we make.
-                    // This protects us when we have many copies of the same records, as
-                    // the DD representation uses a binary count and may not exhaust our
-                    // memory in situtations where this copying might.
-                    if let Some(limit) = max_results {
-                        let limit = std::convert::TryInto::<Diff>::try_into(limit);
-                        if let Ok(limit) = limit {
-                            copies = std::cmp::min(copies, limit);
-                        }
-                    }
-                    for _ in 0..copies {
-                        results.push(result.clone());
+                    } else {
+                        copies.try_into().unwrap()
+                    };
+                    // if copies > 0 ... otherwise skip
+                    if let Some(copies) = NonZeroUsize::new(copies) {
+                        results.push((result, copies));
                     }
 
                     // If we hold many more than `max_results` records, we can thin down
@@ -453,13 +526,13 @@ impl PendingPeek {
                                 // inner test (as we prefer not to maintain `Vec<Datum>`
                                 // in the other case).
                                 results.sort_by(|left, right| {
-                                    let left_datums = l_datum_vec.borrow_with(left);
-                                    let right_datums = r_datum_vec.borrow_with(right);
+                                    let left_datums = l_datum_vec.borrow_with(&left.0);
+                                    let right_datums = r_datum_vec.borrow_with(&right.0);
                                     mz_expr::compare_columns(
                                         &self.finishing.order_by,
                                         &left_datums,
                                         &right_datums,
-                                        || left.cmp(&right),
+                                        || left.0.cmp(&right.0),
                                     )
                                 });
                                 results.truncate(max_results);
