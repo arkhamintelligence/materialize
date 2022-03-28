@@ -14,6 +14,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use mz_dataflow_types::client::ComputeInstanceId;
 use mz_expr::{GlobalId, Id, LocalId};
 use mz_ore::str::StrExt;
 
@@ -21,7 +22,7 @@ use crate::ast::display::{AstDisplay, AstFormatter};
 use crate::ast::fold::Fold;
 use crate::ast::visit_mut::VisitMut;
 use crate::ast::{
-    self, AstInfo, Cte, Expr, Ident, Query, Raw, RawName, Statement, UnresolvedDataType,
+    self, AstInfo, Cte, Expr, Ident, Query, Raw, RawIdent, RawName, Statement, UnresolvedDataType,
     UnresolvedObjectName,
 };
 use crate::catalog::{CatalogItemType, CatalogTypeDetails, SessionCatalog};
@@ -213,6 +214,15 @@ impl ResolvedObjectName {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ResolvedClusterName(pub ComputeInstanceId);
+
+impl AstDisplay for ResolvedClusterName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(format!("[{}]", self.0))
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum ResolvedDataType {
     AnonymousList(Box<ResolvedDataType>),
     AnonymousMap {
@@ -281,8 +291,31 @@ impl fmt::Display for ResolvedDataType {
     }
 }
 
+impl ResolvedDataType {
+    pub(crate) fn get_ids(&self) -> Vec<GlobalId> {
+        let mut ids = Vec::new();
+        match self {
+            ResolvedDataType::AnonymousList(typ) => {
+                ids.extend(typ.get_ids());
+            }
+            ResolvedDataType::AnonymousMap {
+                key_type,
+                value_type,
+            } => {
+                ids.extend(key_type.get_ids());
+                ids.extend(value_type.get_ids());
+            }
+            ResolvedDataType::Named { id, .. } => {
+                ids.push(id.clone());
+            }
+        };
+        ids
+    }
+}
+
 impl AstInfo for Aug {
     type ObjectName = ResolvedObjectName;
+    type ClusterName = ResolvedClusterName;
     type DataType = ResolvedDataType;
     type Id = Id;
 }
@@ -526,13 +559,47 @@ impl<'a> Fold<Raw, Aug> for NameResolver<'a> {
             }
         }
     }
+
+    fn fold_cluster_name(
+        &mut self,
+        cluster_name: <Raw as AstInfo>::ClusterName,
+    ) -> <Aug as AstInfo>::ClusterName {
+        match cluster_name {
+            RawIdent::Unresolved(ident) => {
+                match self.catalog.resolve_compute_instance(Some(ident.as_str())) {
+                    Ok(cluster) => ResolvedClusterName(cluster.id()),
+                    Err(e) => {
+                        self.status = Err(e.into());
+                        ResolvedClusterName(0)
+                    }
+                }
+            }
+            RawIdent::Resolved(ident) => match ident.parse() {
+                Ok(id) => ResolvedClusterName(id),
+                Err(e) => {
+                    self.status = Err(e.into());
+                    ResolvedClusterName(0)
+                }
+            },
+        }
+    }
 }
 
 pub fn resolve_names_stmt(
-    catalog: &dyn SessionCatalog,
+    scx: &mut StatementContext,
+    stmt: Statement<Raw>,
+) -> Result<(Statement<Aug>, HashSet<GlobalId>), PlanError> {
+    let mut n = NameResolver::new(scx.catalog);
+    let result = n.fold_statement(stmt);
+    n.status?;
+    Ok((result, n.ids))
+}
+
+pub fn resolve_names_stmt_show(
+    scx: &StatementContext,
     stmt: Statement<Raw>,
 ) -> Result<Statement<Aug>, PlanError> {
-    let mut n = NameResolver::new(catalog);
+    let mut n = NameResolver::new(scx.catalog);
     let result = n.fold_statement(stmt);
     n.status?;
     Ok(result)
@@ -545,7 +612,6 @@ pub fn resolve_names(qcx: &mut QueryContext, query: Query<Raw>) -> Result<Query<
     let mut n = NameResolver::new(qcx.scx.catalog);
     let result = n.fold_query(query);
     n.status?;
-    qcx.ids.extend(n.ids.iter());
     Ok(result)
 }
 
@@ -553,7 +619,6 @@ pub fn resolve_names_expr(qcx: &mut QueryContext, expr: Expr<Raw>) -> Result<Exp
     let mut n = NameResolver::new(qcx.scx.catalog);
     let result = n.fold_expr(expr);
     n.status?;
-    qcx.ids.extend(n.ids.iter());
     Ok(result)
 }
 
@@ -565,6 +630,26 @@ pub fn resolve_names_data_type(
     let result = n.fold_data_type(data_type);
     n.status?;
     Ok((result, n.ids))
+}
+
+pub fn resolve_names_cluster(
+    scx: &StatementContext,
+    cluster_name: RawIdent,
+) -> Result<ResolvedClusterName, PlanError> {
+    let mut n = NameResolver::new(scx.catalog);
+    let result = n.fold_cluster_name(cluster_name);
+    n.status?;
+    Ok(result)
+}
+
+pub fn resolve_object_name(
+    scx: &StatementContext,
+    object_name: <Raw as AstInfo>::ObjectName,
+) -> Result<<Aug as AstInfo>::ObjectName, PlanError> {
+    let mut n = NameResolver::new(scx.catalog);
+    let result = n.fold_object_name(object_name);
+    n.status?;
+    Ok(result)
 }
 
 /// A general implementation for name resolution on AST elements.
@@ -580,7 +665,6 @@ where
     let mut n = NameResolver::new(qcx.scx.catalog);
     let result = f(&mut n);
     n.status?;
-    qcx.ids.extend(n.ids.iter());
     Ok(result)
 }
 

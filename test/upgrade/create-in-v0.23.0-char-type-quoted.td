@@ -7,12 +7,4 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-name: coordd
-pre-image:
-  - type: cargo-build
-    bin: coordd
-    strip: false
-    extract:
-      krb5-src:
-        install/bin/kinit: .
-        install/bin/kdestroy: .
+> CREATE MATERIALIZED VIEW char_type_quoted_view AS SELECT 'a'::"char"

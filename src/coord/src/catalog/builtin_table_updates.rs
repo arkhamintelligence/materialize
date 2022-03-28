@@ -20,9 +20,9 @@ use mz_sql::names::DatabaseSpecifier;
 use mz_sql_parser::ast::display::AstDisplay;
 
 use crate::catalog::builtin::{
-    MZ_ARRAY_TYPES, MZ_AVRO_OCF_SINKS, MZ_BASE_TYPES, MZ_COLUMNS, MZ_DATABASES, MZ_FUNCTIONS,
-    MZ_INDEXES, MZ_INDEX_COLUMNS, MZ_KAFKA_SINKS, MZ_LIST_TYPES, MZ_MAP_TYPES, MZ_PSEUDO_TYPES,
-    MZ_ROLES, MZ_SCHEMAS, MZ_SINKS, MZ_SOURCES, MZ_TABLES, MZ_TYPES, MZ_VIEWS,
+    MZ_ARRAY_TYPES, MZ_AVRO_OCF_SINKS, MZ_BASE_TYPES, MZ_CLUSTERS, MZ_COLUMNS, MZ_DATABASES,
+    MZ_FUNCTIONS, MZ_INDEXES, MZ_INDEX_COLUMNS, MZ_KAFKA_SINKS, MZ_LIST_TYPES, MZ_MAP_TYPES,
+    MZ_PSEUDO_TYPES, MZ_ROLES, MZ_SCHEMAS, MZ_SINKS, MZ_SOURCES, MZ_TABLES, MZ_TYPES, MZ_VIEWS,
 };
 use crate::catalog::{
     CatalogItem, CatalogState, Func, Index, Sink, SinkConnector, SinkConnectorState, Source, Table,
@@ -88,6 +88,19 @@ impl CatalogState {
                 Datum::UInt32(role.oid),
                 Datum::String(&name),
             ]),
+            diff,
+        }
+    }
+
+    pub(super) fn pack_compute_instance_update(
+        &self,
+        name: &str,
+        diff: Diff,
+    ) -> BuiltinTableUpdate {
+        let compute_instance_id = &self.compute_instances_by_name[name];
+        BuiltinTableUpdate {
+            id: MZ_CLUSTERS.id,
+            row: Row::pack_slice(&[Datum::Int64(*compute_instance_id), Datum::String(&name)]),
             diff,
         }
     }
@@ -273,6 +286,7 @@ impl CatalogState {
                     Datum::String(name),
                     Datum::String(connector.name()),
                     Datum::String(self.is_volatile(id).as_str()),
+                    Datum::Int64(sink.compute_instance),
                 ]),
                 diff,
             });
@@ -307,6 +321,7 @@ impl CatalogState {
                 Datum::String(&index.on.to_string()),
                 Datum::String(self.is_volatile(id).as_str()),
                 Datum::from(index.enabled),
+                Datum::Int64(index.compute_instance),
             ]),
             diff,
         });
